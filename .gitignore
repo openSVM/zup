@@ -1,0 +1,47 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+/release/
+/debug/
+/spice-main
+
+# Build binaries
+/server
+/example-server
+/benchmark
+
+# Dependencies
+/deps/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
