@@ -41,6 +41,9 @@ jobs:
         # Enable debug output
         set -x
         
+        # Create logs directory
+        mkdir -p logs
+        
         # Build the test image with cache
         docker build \
           --cache-from=type=local,src=/tmp/.buildx-cache \
@@ -58,8 +61,10 @@ jobs:
           --name opensvm-grpc-test \
           -e RUST_BACKTRACE=1 \
           -e ZIG_DEBUG_LOG=debug \
+          -v "$(pwd)/logs:/app/logs" \
+          -v "$(pwd)/zig-cache:/app/zig-cache" \
           opensvm-grpc-test \
-          bash -c "timeout 45s ./scripts/run_grpc_tests_local.sh"
+          bash -c "./scripts/run_grpc_tests_local.sh"
           
         # Move cache
         rm -rf /tmp/.buildx-cache
@@ -71,6 +76,7 @@ jobs:
       with:
         name: test-logs
         path: |
+          logs/
           zig-out/
           zig-cache/
           /tmp/.buildx-cache
