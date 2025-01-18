@@ -1,8 +1,8 @@
-pub const core = @import("framework/core.zig");
-pub const framework = @import("framework/server.zig");
-pub const schema = @import("framework/trpc/schema.zig");
-pub const runtime_router = @import("framework/trpc/runtime_router.zig");
-pub const grpc_router = @import("framework/trpc/grpc_router.zig");
+pub const core = @import("src/framework/core.zig");
+pub const framework = @import("src/framework/server.zig");
+pub const schema = @import("src/framework/trpc/schema.zig");
+pub const runtime_router = @import("src/framework/trpc/runtime_router.zig");
+pub const grpc_router = @import("src/framework/trpc/grpc_router.zig");
 
 test {
     _ = core;
