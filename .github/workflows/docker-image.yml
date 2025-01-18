@@ -16,8 +16,6 @@ jobs:
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v1
-      with:
-        driver: containerd
 
     - name: Build the Docker image
       run: docker build --cache-from=type=local,src=/tmp/.buildx-cache --cache-to=type=local,dest=/tmp/.buildx-cache-new -t opensvm-grpc-test -f Dockerfile.test --progress=plain .
