@@ -83,11 +83,12 @@ timeout_seconds=45
 
 {
     # Run tests with verbose output and port override
+    # Use perl for cross-platform timeout
     RUST_BACKTRACE=1 \
     ZIG_DEBUG_COLOR=1 \
     ZIG_DEBUG_LOG=debug \
     TEST_PORT=$TEST_PORT \
-    timeout "$timeout_seconds" \
+    perl -e "\$SIG{ALRM} = sub { die 'timeout' }; alarm $timeout_seconds; exec @ARGV" \
     zig build test-trpc -Doptimize=Debug -vv
     
     exit_code=$?
