@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     procps \
     strace \
+    git \
+    curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Zig
@@ -18,15 +21,29 @@ RUN wget https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz \
 ENV PATH="/usr/local/zig:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV ZIG_DEBUG_LOG=debug
 ENV RUST_BACKTRACE=1
+ENV ZIG_GLOBAL_CACHE_DIR=/root/.cache/zig
 
 WORKDIR /app
+
+# Copy only build files first for better caching
+COPY build.zig build.zig.zon ./
+
+# Fetch dependencies
+RUN zig build --fetch \
+    && mkdir -p zig-cache \
+    && touch zig-cache/log.txt
+
+# Copy the rest of the files
 COPY . .
 
 # Make scripts executable
 RUN chmod +x scripts/*.sh
 
-# Pre-build to catch any build errors early
-RUN zig build test -Doptimize=Debug || (cat zig-cache/log.txt && exit 1)
+# Pre-build with verbose output
+RUN zig build test -Doptimize=Debug -vv || \
+    (echo "=== Build failed. Last 50 lines of log: ===" && \
+     tail -n 50 zig-cache/log.txt && \
+     exit 1)
 
 # Default command (can be overridden)
 CMD ["./scripts/run_grpc_tests_local.sh"]
