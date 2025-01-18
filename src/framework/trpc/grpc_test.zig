@@ -198,9 +198,8 @@ test "trpc over grpc - basic procedure call" {
     try router.listen(port);
     errdefer shutdownServer(&router);
 
-    // Get actual port and server
+    // Get server instance
     const server = router.server.?;
-    const port = server.socket.listen_address.getPort();
 
     try waitForServer(allocator, port);
 
