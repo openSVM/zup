@@ -35,10 +35,19 @@ log "Available Memory: $(free -h 2>/dev/null || vm_stat 2>/dev/null || echo 'Mem
 log "CPU Info: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 'CPU info not available')"
 
 log "=== Network Configuration ==="
-ip addr show || ifconfig
-netstat -tulpn || ss -tulpn
-log "Network interfaces:"
-ip link show || ifconfig -a
+if command -v ip >/dev/null 2>&1; then
+    # Linux
+    log "Network interfaces:"
+    ip addr show
+    log "Listening ports:"
+    ss -tulpn || netstat -tulpn
+else
+    # macOS/BSD
+    log "Network interfaces:"
+    ifconfig
+    log "Listening ports:"
+    netstat -an | grep LISTEN
+fi
 
 # Validate port availability
 TEST_PORT=${TEST_PORT:-0}
