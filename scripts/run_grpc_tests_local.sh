@@ -27,13 +27,34 @@ cleanup() {
 # Set trap for cleanup
 trap cleanup EXIT INT TERM
 
-# Print system info
+# Print system info and validate network
 log "=== System Information ==="
 log "Operating System: $(uname -a)"
 log "Zig Version: $(zig version)"
 log "Available Memory: $(free -h 2>/dev/null || vm_stat 2>/dev/null || echo 'Memory info not available')"
 log "CPU Info: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 'CPU info not available')"
-log "Network Info: $(ip addr show 2>/dev/null || ifconfig 2>/dev/null || echo 'Network info not available')"
+
+log "=== Network Configuration ==="
+ip addr show || ifconfig
+netstat -tulpn || ss -tulpn
+log "Network interfaces:"
+ip link show || ifconfig -a
+
+# Validate port availability
+TEST_PORT=${TEST_PORT:-0}
+if [ "$TEST_PORT" != "0" ]; then
+    log "Checking port $TEST_PORT availability..."
+    if lsof -i :$TEST_PORT > /dev/null 2>&1; then
+        log "Error: Port $TEST_PORT is already in use"
+        lsof -i :$TEST_PORT
+        exit 1
+    fi
+    log "Port $TEST_PORT is available"
+    
+    # Test local network connectivity
+    log "Testing local network connectivity..."
+    nc -zv 127.0.0.1 $TEST_PORT 2>&1 || log "Port $TEST_PORT not yet listening (expected)"
+fi
 
 # Verify build files
 log "=== Verifying build files ==="
