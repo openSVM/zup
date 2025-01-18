@@ -20,7 +20,7 @@ pub const WebSocketFrame = struct {
         pong = 0xA,
     };
 
-    pub fn encode(self: WebSocketFrame, writer: anytype) !void {
+    pub fn encode(self: WebSocketFrame, allocator: std.mem.Allocator, writer: anytype) !void {
         std.debug.print("\nEncoding frame: opcode={}, mask={}, payload={s}\n", .{ self.opcode, self.mask, self.payload });
 
         var first_byte: u8 = 0;
@@ -57,7 +57,7 @@ pub const WebSocketFrame = struct {
             try writer.writeAll(&masking_key);
 
             // Write masked payload
-            var masked_bytes = try std.ArrayList(u8).initCapacity(std.testing.allocator, self.payload.len);
+            var masked_bytes = try std.ArrayList(u8).initCapacity(allocator, self.payload.len);
             defer masked_bytes.deinit();
 
             for (self.payload, 0..) |byte, i| {
@@ -72,7 +72,7 @@ pub const WebSocketFrame = struct {
         }
     }
 
-    pub fn decode(reader: anytype) !WebSocketFrame {
+    pub fn decode(allocator: std.mem.Allocator, reader: anytype) !WebSocketFrame {
         std.debug.print("\nDecoding frame...\n", .{});
 
         const first_byte = try reader.readByte();
@@ -101,8 +101,12 @@ pub const WebSocketFrame = struct {
             break :blk key;
         } else [_]u8{0} ** 4;
 
-        const payload = try reader.readAllAlloc(std.testing.allocator, @intCast(extended_payload_len));
-        errdefer std.testing.allocator.free(payload);
+        const payload = try allocator.alloc(u8, @intCast(extended_payload_len));
+        errdefer allocator.free(payload);
+
+        // Read payload data
+        const n = try reader.readAll(payload);
+        if (n != extended_payload_len) return error.InvalidFrame;
 
         std.debug.print("Raw payload: {any}\n", .{payload});
 
@@ -125,7 +129,7 @@ pub const WebSocketFrame = struct {
     }
 };
 
-pub fn handleUpgrade(stream: net.Stream, request: []const u8) !void {
+pub fn handleUpgrade(allocator: std.mem.Allocator, stream: net.Stream, request: []const u8) !void {
     // Parse WebSocket key from headers
     const key_prefix = "Sec-WebSocket-Key: ";
     const key_start = std.mem.indexOf(u8, request, key_prefix) orelse return error.MissingWebSocketKey;
@@ -148,7 +152,7 @@ pub fn handleUpgrade(stream: net.Stream, request: []const u8) !void {
 
     // Send upgrade response
     const response = try std.fmt.allocPrint(
-        std.testing.allocator,
+        allocator,
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -156,14 +160,14 @@ pub fn handleUpgrade(stream: net.Stream, request: []const u8) !void {
             "\r\n",
         .{encoded_key},
     );
-    defer std.testing.allocator.free(response);
+    defer allocator.free(response);
 
     _ = try stream.write(response);
 }
 
-pub fn writeMessage(stream: net.Stream, message: []const u8) !void {
-    const payload = try std.testing.allocator.dupe(u8, message);
-    defer std.testing.allocator.free(payload);
+pub fn writeMessage(allocator: std.mem.Allocator, stream: net.Stream, message: []const u8) !void {
+    const payload = try allocator.dupe(u8, message);
+    defer allocator.free(payload);
 
     const frame = WebSocketFrame{
         .opcode = .text,
@@ -172,11 +176,11 @@ pub fn writeMessage(stream: net.Stream, message: []const u8) !void {
 
     var frame_buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&frame_buf);
-    try frame.encode(fbs.writer());
+    try frame.encode(allocator, fbs.writer());
     _ = try stream.write(fbs.getWritten());
 }
 
-pub fn readMessage(stream: net.Stream) !WebSocketFrame {
+pub fn readMessage(allocator: std.mem.Allocator, stream: net.Stream) !WebSocketFrame {
     // Read header bytes (2-14 bytes depending on payload length)
     var header_buf: [14]u8 = undefined;
     const header_n = try stream.read(header_buf[0..2]);
@@ -223,8 +227,8 @@ pub fn readMessage(stream: net.Stream) !WebSocketFrame {
     }
 
     // Read payload
-    const payload = try std.testing.allocator.alloc(u8, @intCast(extended_payload_len));
-    errdefer std.testing.allocator.free(payload);
+    const payload = try allocator.alloc(u8, @intCast(extended_payload_len));
+    errdefer allocator.free(payload);
 
     var remaining = extended_payload_len;
     var offset: usize = 0;

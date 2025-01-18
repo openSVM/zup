@@ -103,6 +103,95 @@ const method = ctx.request.method;
 
 The framework provides built-in WebSocket support:
 
+## tRPC
+
+The framework includes a tRPC implementation for building type-safe APIs. Here's a basic example:
+
+```zig
+const std = @import("std");
+const trpc = @import("framework/trpc.zig");
+const core = @import("framework/core.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    // Initialize router
+    var router = trpc.Router.init(allocator);
+    defer router.deinit();
+
+    // Register procedures
+    try router.procedure("ping", handlePing, null, null);
+    try router.procedure("echo", handleEcho, null, null);
+
+    // Create server and mount router
+    var server = try core.Server.init(allocator, .{ .port = 3000 });
+    defer server.deinit();
+    try router.mount(&server);
+
+    std.debug.print("tRPC server running on http://localhost:3000\n", .{});
+    try server.listen();
+}
+
+fn handlePing(ctx: *core.Context, _: ?std.json.Value) !std.json.Value {
+    _ = ctx;
+    return std.json.Value{ .object = std.json.ObjectMap.init(std.heap.page_allocator) };
+}
+
+fn handleEcho(ctx: *core.Context, input: ?std.json.Value) !std.json.Value {
+    _ = ctx;
+    return input orelse std.json.Value{ .null = {} };
+}
+```
+
+### Key Features
+
+- Type-safe procedure definitions
+- Input/output validation
+- JSON-based communication
+- Built-in error handling
+- Seamless integration with HTTP server
+
+### Router Configuration
+
+```zig
+var router = trpc.Router.init(allocator);
+defer router.deinit();
+
+// Set token limits for input/output
+router.setTokenLimits(4096, 4096);
+
+// Mount to HTTP server
+try router.mount(&server);
+```
+
+### Procedure Definition
+
+```zig
+try router.procedure(
+    "procedureName",  // Procedure name
+    handlerFunction,  // Handler function
+    inputSchema,      // Optional input schema
+    outputSchema      // Optional output schema
+);
+```
+
+### Schema Validation
+
+Schemas can be defined using the Schema struct:
+
+```zig
+const schema = trpc.Schema{
+    .object = .{
+        .Object = .{
+            .required = &[_][]const u8{"name", "age"},
+            .properties = std.StringHashMap(trpc.Schema).init(allocator),
+        },
+    },
+};
+```
+
 ### Handling WebSocket Connections
 
 ```zig

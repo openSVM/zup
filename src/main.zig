@@ -47,6 +47,100 @@ pub const Server = struct {
             thread.join();
         }
     }
+
+    fn handleWebSocket(self: *Server, stream: net.Stream, data: []const u8) !void {
+        try ws.handleUpgrade(self.allocator, stream, data);
+
+        // Echo server - read messages and send them back
+        while (true) {
+            const frame = ws.readMessage(self.allocator, stream) catch |err| switch (err) {
+                error.ConnectionResetByPeer,
+                error.BrokenPipe,
+                error.ConnectionTimedOut,
+                error.WouldBlock,
+                => {
+                    std.debug.print("\nServer: Connection error: {}\n", .{err});
+                    return;
+                },
+                else => {
+                    std.debug.print("\nServer: Other error: {}\n", .{err});
+                    return err;
+                },
+            };
+            defer self.allocator.free(frame.payload);
+
+            std.debug.print("\nServer: Received frame with opcode: {}, payload: {s}\n", .{ frame.opcode, frame.payload });
+
+            switch (frame.opcode) {
+                .text, .binary => {
+                    std.debug.print("\nServer: Echoing message back\n", .{});
+                    try ws.writeMessage(self.allocator, stream, frame.payload);
+                },
+                .ping => {
+                    const pong_payload = try self.allocator.dupe(u8, frame.payload);
+                    errdefer self.allocator.free(pong_payload);
+                    const pong = ws.WebSocketFrame{
+                        .opcode = .pong,
+                        .payload = pong_payload,
+                    };
+                    var buffer: [128]u8 = undefined;
+                    var fbs = std.io.fixedBufferStream(&buffer);
+                    try pong.encode(self.allocator, fbs.writer());
+                    try stream.writeAll(fbs.getWritten());
+                    self.allocator.free(pong_payload);
+                },
+                .close => {
+                    // Echo back the close frame
+                    const close_frame = ws.WebSocketFrame{
+                        .opcode = .close,
+                        .payload = frame.payload,
+                    };
+                    var buffer: [128]u8 = undefined;
+                    var fbs = std.io.fixedBufferStream(&buffer);
+                    try close_frame.encode(self.allocator, fbs.writer());
+                    try stream.writeAll(fbs.getWritten());
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn handleConnection(self: *Server, stream: net.Stream) !void {
+        var buf: [4096]u8 = undefined;
+        const n = stream.read(&buf) catch |err| switch (err) {
+            error.WouldBlock => return error.WouldBlock,
+            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+            error.BrokenPipe => return error.BrokenPipe,
+            error.ConnectionTimedOut => return error.ConnectionTimedOut,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionResetByPeer;
+
+        const data = buf[0..n];
+
+        // Check for WebSocket upgrade first
+        if (mem.startsWith(u8, data, "GET") and
+            mem.indexOf(u8, data, "Upgrade: websocket") != null and
+            mem.indexOf(u8, data, "Connection: Upgrade") != null and
+            mem.indexOf(u8, data, "Sec-WebSocket-Key:") != null)
+        {
+            try self.handleWebSocket(stream, data);
+            return;
+        }
+
+        // Handle regular HTTP requests
+        if (mem.startsWith(u8, data, "GET /")) {
+            try stream.writeAll(GET_RESPONSE);
+            return;
+        }
+        if (mem.startsWith(u8, data, "POST /")) {
+            try stream.writeAll(POST_RESPONSE);
+            return;
+        }
+
+        try sendHttpError(stream, 400, "Bad Request");
+    }
 };
 
 fn workerThread(server: *Server) void {
@@ -70,7 +164,7 @@ fn workerThread(server: *Server) void {
 
         // Handle connection with keep-alive
         while (server.running.load(.acquire)) {
-            handleConnection(conn.stream) catch |err| switch (err) {
+            server.handleConnection(conn.stream) catch |err| switch (err) {
                 error.ConnectionResetByPeer,
                 error.BrokenPipe,
                 error.ConnectionTimedOut,
@@ -80,42 +174,6 @@ fn workerThread(server: *Server) void {
             };
         }
     }
-}
-
-fn handleConnection(stream: net.Stream) !void {
-    var buf: [4096]u8 = undefined;
-    const n = stream.read(&buf) catch |err| switch (err) {
-        error.WouldBlock => return error.WouldBlock,
-        error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
-        error.BrokenPipe => return error.BrokenPipe,
-        error.ConnectionTimedOut => return error.ConnectionTimedOut,
-        else => return err,
-    };
-    if (n == 0) return error.ConnectionResetByPeer;
-
-    const data = buf[0..n];
-
-    // Check for WebSocket upgrade first
-    if (mem.startsWith(u8, data, "GET") and
-        mem.indexOf(u8, data, "Upgrade: websocket") != null and
-        mem.indexOf(u8, data, "Connection: Upgrade") != null and
-        mem.indexOf(u8, data, "Sec-WebSocket-Key:") != null)
-    {
-        try handleWebSocket(stream, data);
-        return;
-    }
-
-    // Handle regular HTTP requests
-    if (mem.startsWith(u8, data, "GET /")) {
-        try stream.writeAll(GET_RESPONSE);
-        return;
-    }
-    if (mem.startsWith(u8, data, "POST /")) {
-        try stream.writeAll(POST_RESPONSE);
-        return;
-    }
-
-    try sendHttpError(stream, 400, "Bad Request");
 }
 
 const GET_RESPONSE =
@@ -135,64 +193,6 @@ const POST_RESPONSE =
     \\
     \\OK
 ;
-
-fn handleWebSocket(stream: net.Stream, data: []const u8) !void {
-    try ws.handleUpgrade(stream, data);
-
-    // Echo server - read messages and send them back
-    while (true) {
-        const frame = ws.readMessage(stream) catch |err| switch (err) {
-            error.ConnectionResetByPeer,
-            error.BrokenPipe,
-            error.ConnectionTimedOut,
-            error.WouldBlock,
-            => {
-                std.debug.print("\nServer: Connection error: {}\n", .{err});
-                return;
-            },
-            else => {
-                std.debug.print("\nServer: Other error: {}\n", .{err});
-                return err;
-            },
-        };
-        defer std.testing.allocator.free(frame.payload);
-
-        std.debug.print("\nServer: Received frame with opcode: {}, payload: {s}\n", .{ frame.opcode, frame.payload });
-
-        switch (frame.opcode) {
-            .text, .binary => {
-                std.debug.print("\nServer: Echoing message back\n", .{});
-                try ws.writeMessage(stream, frame.payload);
-            },
-            .ping => {
-                const pong_payload = try std.testing.allocator.dupe(u8, frame.payload);
-                errdefer std.testing.allocator.free(pong_payload);
-                const pong = ws.WebSocketFrame{
-                    .opcode = .pong,
-                    .payload = pong_payload,
-                };
-                var buffer: [128]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&buffer);
-                try pong.encode(fbs.writer());
-                try stream.writeAll(fbs.getWritten());
-                std.testing.allocator.free(pong_payload);
-            },
-            .close => {
-                // Echo back the close frame
-                const close_frame = ws.WebSocketFrame{
-                    .opcode = .close,
-                    .payload = frame.payload,
-                };
-                var buffer: [128]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&buffer);
-                try close_frame.encode(fbs.writer());
-                try stream.writeAll(fbs.getWritten());
-                return;
-            },
-            else => {},
-        }
-    }
-}
 
 fn sendHttpError(stream: net.Stream, code: u16, message: []const u8) !void {
     var buf: [256]u8 = undefined;
@@ -322,7 +322,7 @@ test "WebSocket handling" {
 
         var frame_buf: [128]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&frame_buf);
-        try frame.encode(fbs.writer());
+        try frame.encode(std.testing.allocator, fbs.writer());
         const written = fbs.getWritten();
         std.debug.print("\nSending frame: {any}\n", .{written});
         _ = try client.write(written);
@@ -349,7 +349,7 @@ test "WebSocket handling" {
             };
             std.debug.print("\nReceived response: {any}\n", .{buf[0..echo_n]});
             var stream = std.io.fixedBufferStream(buf[0..echo_n]);
-            const echo_frame = try ws.WebSocketFrame.decode(stream.reader());
+            const echo_frame = try ws.WebSocketFrame.decode(std.testing.allocator, stream.reader());
             defer std.testing.allocator.free(echo_frame.payload);
             std.debug.print("\nDecoded frame payload: {s}\n", .{echo_frame.payload});
 
@@ -368,7 +368,7 @@ test "WebSocket handling" {
             };
             var close_buf: [128]u8 = undefined;
             var close_fbs = std.io.fixedBufferStream(&close_buf);
-            try close_frame.encode(close_fbs.writer());
+            try close_frame.encode(std.testing.allocator, close_fbs.writer());
             _ = try client.write(close_fbs.getWritten());
 
             // Wait for server's close response
@@ -376,7 +376,7 @@ test "WebSocket handling" {
             _ = while (close_retries > 0) : (close_retries -= 1) {
                 if (client.read(&buf)) |read_bytes| {
                     var close_stream = std.io.fixedBufferStream(buf[0..read_bytes]);
-                    const response_frame = try ws.WebSocketFrame.decode(close_stream.reader());
+                    const response_frame = try ws.WebSocketFrame.decode(std.testing.allocator, close_stream.reader());
                     if (response_frame.opcode == .close) {
                         std.testing.allocator.free(response_frame.payload);
                         break;

@@ -1,0 +1,51 @@
+=== System Information ===
+Date: Thu Jan  9 18:00:53 MSK 2025
+CPU: Apple M3 Max
+Memory: 128 GB
+Thread Count: 16
+
+=== Basic GET Benchmark ===
+Configuration:
+- Method: GET
+- Duration: 10s
+- Connections: 100
+
+
+=== High Concurrency GET Benchmark ===
+Configuration:
+- Method: GET
+- Duration: 10s
+- Connections: 1000
+
+
+=== Extended GET Benchmark ===
+Configuration:
+- Method: GET
+- Duration: 30s
+- Connections: 500
+
+
+=== Basic POST Benchmark ===
+Configuration:
+- Method: POST
+- Duration: 10s
+- Connections: 100
+
+
+=== High Concurrency POST Benchmark ===
+Configuration:
+- Method: POST
+- Duration: 10s
+- Connections: 1000
+
+
+=== Extended POST Benchmark ===
+Configuration:
+- Method: POST
+- Duration: 30s
+- Connections: 500
+
+
+=== Summary ===
+Benchmark completed at: Thu Jan  9 18:02:35 MSK 2025
+Total duration: 102 seconds

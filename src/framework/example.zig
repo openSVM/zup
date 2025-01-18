@@ -7,10 +7,16 @@ const core = @import("core.zig");
 const LoggerMiddleware = struct {
     start_time: i64,
 
-    pub fn init() LoggerMiddleware {
-        return .{
+    pub fn init() *LoggerMiddleware {
+        const middleware = std.heap.page_allocator.create(LoggerMiddleware) catch unreachable;
+        middleware.* = .{
             .start_time = 0,
         };
+        return middleware;
+    }
+
+    pub fn deinit(self: *LoggerMiddleware) void {
+        std.heap.page_allocator.destroy(self);
     }
 
     pub fn handle(self: *LoggerMiddleware, ctx: *core.Context, next: core.Handler) !void {
@@ -23,7 +29,7 @@ const LoggerMiddleware = struct {
 
 // Example handlers
 fn homeHandlerImpl(ctx: *core.Context) !void {
-    try ctx.text("Welcome to Zig Web Framework!");
+    try ctx.text("Welcome to Zup!");
 }
 
 fn jsonHandlerImpl(ctx: *core.Context) !void {
@@ -64,14 +70,14 @@ pub fn main() !void {
 
     // Add global middleware
     var logger = LoggerMiddleware.init();
-    const logger_middleware = core.Middleware.init(&logger, LoggerMiddleware.handle);
-    try server.use(logger_middleware);
+    defer logger.deinit();
+    try server.use(core.Middleware.init(logger, LoggerMiddleware.handle));
 
     // Define routes
-    try server.get("/", &homeHandlerImpl);
-    try server.get("/json", &jsonHandlerImpl);
-    try server.get("/users/:id", &userHandlerImpl);
-    try server.post("/echo", &echoHandlerImpl);
+    try server.get("/", homeHandlerImpl);
+    try server.get("/json", jsonHandlerImpl);
+    try server.get("/users/:id", userHandlerImpl);
+    try server.post("/echo", echoHandlerImpl);
 
     // Start server
     std.log.info("Server running at http://127.0.0.1:8080", .{});
@@ -94,7 +100,7 @@ test "basic routes" {
         }
     }.handler);
 
-    try server.post("/echo", &echoHandlerImpl);
+    try server.post("/echo", echoHandlerImpl);
 
     // Start server in background
     const thread = try std.Thread.spawn(.{}, Server.start, .{&server});

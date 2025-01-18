@@ -275,8 +275,9 @@ pub const Context = struct {
         self.response.setBody(body);
     }
 
-    pub fn status(self: *Context, code: u16) void {
+    pub fn status(self: *Context, code: u16) *Context {
         self.response.status = code;
+        return self;
     }
 };
 
@@ -284,33 +285,77 @@ pub const Handler = *const fn (*Context) anyerror!void;
 pub const Middleware = struct {
     data: *anyopaque,
     vtable: *const VTable,
+    allocator: ?Allocator,
 
     pub const VTable = struct {
         handle: *const fn (data: *anyopaque, ctx: *Context, next: Handler) anyerror!void,
+        deinit: ?*const fn (data: *anyopaque, allocator: Allocator) void,
     };
 
     pub fn init(
+        allocator: Allocator,
         data: anytype,
-        comptime handleFn: fn (@TypeOf(data), *Context, Handler) anyerror!void,
-    ) Middleware {
-        const T = @TypeOf(data);
-        const ptr = data;
-        const vtable = &struct {
-            fn wrapperFn(data_ptr: *anyopaque, ctx: *Context, next: Handler) anyerror!void {
-                const self = @as(*T, @ptrCast(@alignCast(data_ptr)));
-                return handleFn(self, ctx, next);
-            }
-            const vtable = VTable{ .handle = wrapperFn };
-        }.vtable;
-
-        return .{
-            .data = @ptrCast(ptr),
-            .vtable = vtable,
+        comptime handleFn: fn (ptr: @TypeOf(data), ctx: *Context, next: Handler) anyerror!void,
+    ) !Middleware {
+        const Ptr = @TypeOf(data);
+        const ptr_info = @typeInfo(Ptr);
+        const needs_allocation = switch (ptr_info) {
+            .Pointer => false,
+            else => true,
         };
+
+        // Create a static vtable for this specific type
+        const static_vtable = struct {
+            fn handle(data_ptr: *anyopaque, ctx: *Context, next: Handler) anyerror!void {
+                const ptr = switch (ptr_info) {
+                    .Pointer => @as(Ptr, @ptrCast(@alignCast(data_ptr))),
+                    else => @as(*Ptr, @ptrCast(@alignCast(data_ptr))),
+                };
+                return handleFn(ptr, ctx, next);
+            }
+
+            fn deinit(data_ptr: *anyopaque, alloc: Allocator) void {
+                if (needs_allocation) {
+                    const ptr = @as(*Ptr, @ptrCast(@alignCast(data_ptr)));
+                    alloc.destroy(ptr);
+                }
+            }
+        };
+
+        if (needs_allocation) {
+            // Allocate memory for the data and copy it
+            const ptr = try allocator.create(Ptr);
+            ptr.* = data;
+            return .{
+                .data = @ptrCast(ptr),
+                .vtable = &.{
+                    .handle = static_vtable.handle,
+                    .deinit = static_vtable.deinit,
+                },
+                .allocator = allocator,
+            };
+        } else {
+            return .{
+                .data = @ptrCast(@constCast(data)),
+                .vtable = &.{
+                    .handle = static_vtable.handle,
+                    .deinit = null,
+                },
+                .allocator = null,
+            };
+        }
     }
 
     pub fn handle(self: Middleware, ctx: *Context, next: Handler) !void {
         return self.vtable.handle(self.data, ctx, next);
+    }
+
+    pub fn deinit(self: *Middleware) void {
+        if (self.allocator) |allocator| {
+            if (self.vtable.deinit) |deinit_fn| {
+                deinit_fn(self.data, allocator);
+            }
+        }
     }
 };
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const net = std.net;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const core = @import("core.zig");
+pub const core = @import("core");
 const router = @import("router.zig");
 const ws = @import("websocket.zig");
 
