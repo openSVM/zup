@@ -1,207 +1,181 @@
 const std = @import("std");
 const net = std.net;
 const mem = std.mem;
+const core = @import("core");
 const Allocator = mem.Allocator;
-pub const core = @import("core");
-const router = @import("router.zig");
-const ws = @import("websocket.zig");
 
-pub const Config = struct {
-    address: []const u8 = "127.0.0.1",
+pub const ServerConfig = struct {
     port: u16 = 8080,
-    thread_count: ?u32 = null,
-    backlog: u31 = 4096,
-    reuse_address: bool = true,
+    host: []const u8 = "127.0.0.1",
+    thread_count: usize = 4,
 };
 
 pub const Server = struct {
+    const Self = @This();
+    const ThreadPool = std.ArrayList(*std.Thread);
+
     allocator: Allocator,
-    router: router.Router,
-    address: net.Address,
-    listener: net.Server,
+    socket: net.Server,
+    routes: std.StringHashMap(core.Handler),
     running: std.atomic.Value(bool),
-    thread_count: u32,
-    threads: []?std.Thread,
+    config: ServerConfig,
+    active_threads: ThreadPool,
+    thread_mutex: std.Thread.Mutex,
 
-    pub fn init(allocator: Allocator, config: Config) !Server {
-        const address = try net.Address.parseIp(config.address, config.port);
-        const thread_count = config.thread_count orelse @as(u32, @intCast(try std.Thread.getCpuCount()));
+    pub fn init(allocator: Allocator, config: ServerConfig) !Self {
+        const address = try net.Address.parseIp(config.host, config.port);
+        const socket = try address.listen(.{
+            .reuse_address = true,
+        });
+        errdefer socket.deinit();
 
-        // Pre-allocate thread array
-        const threads = try allocator.alloc(?std.Thread, thread_count);
-        errdefer allocator.free(threads);
-
-        // Initialize threads to null
-        for (threads) |*thread| {
-            thread.* = null;
-        }
-
-        return Server{
+        return .{
             .allocator = allocator,
-            .router = router.Router.init(allocator),
-            .address = address,
-            .listener = try address.listen(.{
-                .reuse_address = config.reuse_address,
-                .kernel_backlog = @as(u31, @intCast(config.backlog)),
-            }),
+            .socket = socket,
+            .routes = std.StringHashMap(core.Handler).init(allocator),
             .running = std.atomic.Value(bool).init(true),
-            .thread_count = thread_count,
-            .threads = threads,
+            .config = config,
+            .active_threads = ThreadPool.init(allocator),
+            .thread_mutex = std.Thread.Mutex{},
         };
     }
 
-    pub fn deinit(self: *Server) void {
-        // Signal threads to stop
-        self.running.store(false, .release);
+    pub fn deinit(self: *Self) void {
+        // First stop accepting new connections
+        self.stop();
 
-        // Deinit listener to unblock accept()
-        self.listener.deinit();
+        // Close the socket to interrupt any blocking accept calls
+        self.socket.deinit();
 
-        // Wait for spawned threads to finish
-        for (self.threads) |maybe_thread| {
-            if (maybe_thread) |thread| {
+        // Wait for all threads to complete
+        {
+            self.thread_mutex.lock();
+            defer self.thread_mutex.unlock();
+
+            // Copy thread handles to avoid modification during iteration
+            var threads = std.ArrayList(*std.Thread).init(self.allocator);
+            defer threads.deinit();
+
+            for (self.active_threads.items) |thread| {
+                threads.append(thread) catch continue;
+            }
+
+            // Clear active threads list
+            self.active_threads.clearAndFree();
+
+            // Join and cleanup threads
+            for (threads.items) |thread| {
                 thread.join();
+                self.allocator.destroy(thread);
             }
         }
 
-        // Clean up resources
-        self.allocator.free(self.threads);
-        self.router.deinit();
+        // Clean up routes
+        var it = self.routes.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.routes.deinit();
     }
 
-    pub fn start(self: *Server) !void {
-        // Start worker threads
-        for (self.threads) |*maybe_thread| {
-            maybe_thread.* = try std.Thread.spawn(.{}, workerThread, .{self});
+    pub fn get(self: *Self, path: []const u8, handler: core.Handler) !void {
+        const path_owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_owned);
+        try self.routes.put(path_owned, handler);
+    }
+
+    pub fn post(self: *Self, path: []const u8, handler: core.Handler) !void {
+        const path_owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_owned);
+        try self.routes.put(path_owned, handler);
+    }
+
+    pub fn listen(self: *Self) !void {
+        while (self.running.load(.acquire)) {
+            const conn = self.socket.accept() catch |err| switch (err) {
+                error.ConnectionAborted,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                error.SocketNotListening,
+                error.ConnectionResetByPeer,
+                error.WouldBlock,
+                error.ProtocolFailure,
+                error.BlockedByFirewall,
+                => {
+                    if (!self.running.load(.acquire)) break;
+                    std.time.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                },
+                error.FileDescriptorNotASocket,
+                error.OperationNotSupported,
+                error.NetworkSubsystemFailed,
+                error.Unexpected,
+                => return err,
+            };
+
+            // Allocate thread handle on heap so it lives beyond this scope
+            const thread_handle = try self.allocator.create(std.Thread);
+            errdefer self.allocator.destroy(thread_handle);
+
+            // Add thread to active pool before spawning to ensure cleanup
+            {
+                self.thread_mutex.lock();
+                defer self.thread_mutex.unlock();
+                try self.active_threads.append(thread_handle);
+            }
+
+            thread_handle.* = try std.Thread.spawn(.{}, struct {
+                fn run(server: *Self, connection: net.Server.Connection, thread: *std.Thread) !void {
+                    defer {
+                        connection.stream.close();
+                        server.thread_mutex.lock();
+                        defer server.thread_mutex.unlock();
+
+                        for (server.active_threads.items, 0..) |t, i| {
+                            if (t == thread) {
+                                _ = server.active_threads.orderedRemove(i);
+                                server.allocator.destroy(thread);
+                                break;
+                            }
+                        }
+                    }
+
+                    var request_buf: [4096]u8 = undefined;
+                    const bytes_read = try connection.stream.read(&request_buf);
+                    if (bytes_read == 0) return;
+                    const request_data = request_buf[0..bytes_read];
+
+                    var request = try core.Request.parse(server.allocator, request_data);
+                    defer request.deinit();
+
+                    var response = core.Response.init(server.allocator);
+                    defer response.deinit();
+
+                    var ctx = core.Context.init(server.allocator, &request, &response);
+                    defer ctx.deinit();
+
+                    if (server.routes.get(request.path)) |handler| {
+                        handler(&ctx) catch |err| {
+                            _ = ctx.status(500);
+                            try ctx.text("Internal Server Error");
+                            std.log.err("Handler error: {}", .{err});
+                        };
+                    } else {
+                        _ = ctx.status(404);
+                        try ctx.text("Not Found");
+                    }
+
+                    try response.write(connection.stream.writer());
+                }
+            }.run, .{ self, conn, thread_handle });
         }
     }
 
-    // Router delegation methods
-    pub fn get(self: *Server, path: []const u8, handler: core.Handler) !void {
-        try self.router.get(path, handler);
-    }
+    pub fn stop(self: *Self) void {
+        self.running.store(false, .release);
 
-    pub fn post(self: *Server, path: []const u8, handler: core.Handler) !void {
-        try self.router.post(path, handler);
-    }
-
-    pub fn put(self: *Server, path: []const u8, handler: core.Handler) !void {
-        try self.router.put(path, handler);
-    }
-
-    pub fn delete(self: *Server, path: []const u8, handler: core.Handler) !void {
-        try self.router.delete(path, handler);
-    }
-
-    pub fn use(self: *Server, middleware: core.Middleware) !void {
-        try self.router.use(middleware);
+        // Close the socket to interrupt any blocking accept calls
+        self.socket.deinit();
     }
 };
-
-fn workerThread(server: *Server) void {
-    while (server.running.load(.acquire)) {
-        const conn = server.listener.accept() catch |err| {
-            if (!server.running.load(.acquire)) break;
-            if (err == error.ConnectionAborted) break;
-            std.log.err("Accept error: {}", .{err});
-            continue;
-        };
-        defer conn.stream.close();
-
-        handleConnection(server, conn.stream) catch |err| {
-            std.log.err("Connection error: {}", .{err});
-            continue;
-        };
-    }
-}
-
-fn handleConnection(server: *Server, stream: net.Stream) !void {
-    var buf: [8192]u8 = undefined;
-    const n = stream.read(&buf) catch |err| switch (err) {
-        error.ConnectionResetByPeer,
-        error.BrokenPipe,
-        error.ConnectionTimedOut,
-        error.WouldBlock,
-        => return err,
-        else => return error.ConnectionClosed,
-    };
-    if (n == 0) return error.ConnectionResetByPeer;
-
-    const data = buf[0..n];
-    std.log.debug("Received request: {s}", .{data});
-
-    // WebSocket upgrade check
-    if (mem.startsWith(u8, data, "GET") and mem.indexOf(u8, data, "Upgrade: websocket") != null) {
-        try handleWebSocket(stream, data);
-        return;
-    }
-
-    // Parse HTTP request
-    var request = core.Request.parse(server.allocator, data) catch |err| {
-        try sendHttpError(stream, 400, "Bad Request");
-        return err;
-    };
-    defer request.deinit();
-
-    var response = core.Response.init(server.allocator);
-    defer response.deinit();
-
-    var ctx = core.Context.init(server.allocator, &request, &response);
-    defer ctx.deinit();
-
-    // Handle the request through the router
-    server.router.handle(&ctx) catch |err| {
-        response.status = 500;
-        try ctx.text("Internal Server Error");
-        std.log.err("Error handling request: {}", .{err});
-    };
-
-    // Write response
-    try response.write(stream.writer());
-    std.log.debug("Response sent", .{});
-}
-
-fn handleWebSocket(stream: net.Stream, data: []const u8) !void {
-    try ws.handleUpgrade(stream, data);
-
-    while (true) {
-        const frame = ws.readMessage(stream) catch |err| switch (err) {
-            error.ConnectionResetByPeer,
-            error.BrokenPipe,
-            error.ConnectionTimedOut,
-            error.WouldBlock,
-            => return,
-            else => return err,
-        };
-        defer std.heap.page_allocator.free(frame.payload);
-
-        switch (frame.opcode) {
-            .text, .binary => try ws.writeMessage(stream, frame.payload),
-            .ping => {
-                const pong = ws.WebSocketFrame{
-                    .opcode = .pong,
-                    .payload = frame.payload,
-                };
-                var buffer: [128]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&buffer);
-                try pong.encode(fbs.writer());
-                try stream.writeAll(fbs.getWritten());
-            },
-            .close => return,
-            else => {},
-        }
-    }
-}
-
-fn sendHttpError(stream: net.Stream, code: u16, message: []const u8) !void {
-    var buf: [256]u8 = undefined;
-    const response = try std.fmt.bufPrint(&buf,
-        \\HTTP/1.1 {} {s}
-        \\Content-Type: text/plain
-        \\Content-Length: {}
-        \\Connection: close
-        \\
-        \\{s}
-    , .{ code, message, message.len, message });
-    try stream.writeAll(response);
-}

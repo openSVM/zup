@@ -29,7 +29,7 @@ zig-out/
 .Trashes
 ehthumbs.db
 Thumbs.db
-
+logs/
 # Logs
 *.log
 npm-debug.log*

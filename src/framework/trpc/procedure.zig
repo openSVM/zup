@@ -1,9 +1,11 @@
 const std = @import("std");
 const json = std.json;
-const Schema = @import("./schema.zig").Schema;
+const Schema = @import("schema").Schema;
+const core = @import("core");
 
 pub const Procedure = struct {
-    handler: fn (*@import("../core.zig").Context, ?json.Value) anyerror!json.Value,
-    input_schema: ?*Schema,
-    output_schema: ?*Schema,
+    name: []const u8,
+    handler: fn (*core.Context, ?json.Value) anyerror!json.Value,
+    input_schema: ?Schema,
+    output_schema: ?Schema,
 };

@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
     // Schema module
     const schema_module = b.addModule("schema", .{
         .root_source_file = .{ .cwd_relative = "src/framework/trpc/schema.zig" },
+        .imports = &.{
+            .{ .name = "core", .module = core_module },
+        },
     });
 
     // Framework module
@@ -36,6 +39,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "schema", .module = schema_module },
             .{ .name = "framework", .module = framework_module },
             .{ .name = "core", .module = core_module },
+            .{ .name = "spice", .module = spice_dep.module("spice") },
         },
     });
 
@@ -47,119 +51,119 @@ pub fn build(b: *std.Build) void {
             .{ .name = "runtime_router", .module = runtime_router_module },
             .{ .name = "framework", .module = framework_module },
             .{ .name = "core", .module = core_module },
+            .{ .name = "spice", .module = spice_dep.module("spice") },
         },
     });
 
-    // Example server executable
-    const example = b.addExecutable(.{
-        .name = "example-server",
-        .root_source_file = .{ .cwd_relative = "src/framework/example.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    example.root_module.addImport("framework", framework_module);
-    example.root_module.addImport("core", core_module);
-    b.installArtifact(example);
-
-    // Example server run step
-    const example_step = b.step("example", "Run the example server");
-    const run_example = b.addRunArtifact(example);
-    example_step.dependOn(&run_example.step);
-
-    // Original server executable
+    // Server executable
     const server = b.addExecutable(.{
         .name = "server",
         .root_source_file = .{ .cwd_relative = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
+
+    // Add module dependencies to server
+    server.root_module.addImport("framework", framework_module);
+    server.root_module.addImport("core", core_module);
+    server.root_module.addImport("schema", schema_module);
+    server.root_module.addImport("runtime_router", runtime_router_module);
+    server.root_module.addImport("grpc_router", grpc_router_module);
     server.root_module.addImport("spice", spice_dep.module("spice"));
+
     b.installArtifact(server);
 
-    // Server step
-    const server_step = b.step("server", "Build and run the server");
-    const run_server = b.addRunArtifact(server);
-    server_step.dependOn(&run_server.step);
-
-    // Run step (alias for example)
-    const run_step = b.step("run", "Run the example server");
-    run_step.dependOn(example_step);
-
-    // Framework tests
-    const framework_tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/framework/example.zig" },
+    // Client executable
+    const client = b.addExecutable(.{
+        .name = "client",
+        .root_source_file = .{ .cwd_relative = "src/client.zig" },
         .target = target,
         .optimize = optimize,
     });
-    framework_tests.root_module.addImport("framework", framework_module);
+    b.installArtifact(client);
 
-    // tRPC tests
+    // Run steps
+    const run_server_cmd = b.addRunArtifact(server);
+    const run_server_step = b.step("run-server", "Run the gRPC server");
+    run_server_step.dependOn(&run_server_cmd.step);
+
+    const run_client_cmd = b.addRunArtifact(client);
+    const run_client_step = b.step("run-client", "Run the gRPC client");
+    run_client_step.dependOn(&run_client_cmd.step);
+
+    // gRPC Example executable
+    const grpc_example = b.addExecutable(.{
+        .name = "grpc-example",
+        .root_source_file = .{ .cwd_relative = "src/framework/trpc/grpc_example.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies to gRPC example
+    grpc_example.root_module.addImport("framework", framework_module);
+    grpc_example.root_module.addImport("core", core_module);
+    grpc_example.root_module.addImport("schema", schema_module);
+    grpc_example.root_module.addImport("runtime_router", runtime_router_module);
+    grpc_example.root_module.addImport("grpc_router", grpc_router_module);
+    grpc_example.root_module.addImport("spice", spice_dep.module("spice"));
+
+    b.installArtifact(grpc_example);
+
+    const run_example_cmd = b.addRunArtifact(grpc_example);
+    const run_example_step = b.step("run-example", "Run the gRPC example server");
+    run_example_step.dependOn(&run_example_cmd.step);
+
+    // Add test client
+    const test_client = b.addExecutable(.{
+        .name = "grpc-test-client",
+        .root_source_file = .{ .cwd_relative = "src/framework/trpc/grpc_test_client.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_test_client = b.addRunArtifact(test_client);
+    const run_test_client_step = b.step("run-test-client", "Run the test client");
+    run_test_client_step.dependOn(&run_test_client.step);
+
+    // Test step
+    const test_step = b.step("test", "Run all tests");
+
+    // Server tests
+    const server_tests = b.addTest(.{
+        .root_source_file = .{ .cwd_relative = "src/framework/server_test.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies to server tests
+    server_tests.root_module.addImport("framework", framework_module);
+    server_tests.root_module.addImport("core", core_module);
+    server_tests.root_module.addImport("schema", schema_module);
+    server_tests.root_module.addImport("runtime_router", runtime_router_module);
+    server_tests.root_module.addImport("grpc_router", grpc_router_module);
+    server_tests.root_module.addImport("spice", spice_dep.module("spice"));
+
+    const run_server_tests = b.addRunArtifact(server_tests);
+    test_step.dependOn(&run_server_tests.step);
+
+    // TRPC tests
     const trpc_tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/framework/trpc/grpc_test.zig" },
+        .root_source_file = .{ .cwd_relative = "src/framework/trpc_test.zig" },
         .target = target,
         .optimize = optimize,
     });
-    const log_level = b.option(
-        std.log.Level,
-        "log_level",
-        "The log level to use",
-    ) orelse .debug;
-    const build_options = b.addOptions();
-    build_options.addOption(std.log.Level, "log_level", log_level);
-    trpc_tests.root_module.addImport("build_options", build_options.createModule());
+
+    // Add module dependencies to TRPC tests
+    trpc_tests.root_module.addImport("framework", framework_module);
     trpc_tests.root_module.addImport("core", core_module);
     trpc_tests.root_module.addImport("schema", schema_module);
     trpc_tests.root_module.addImport("runtime_router", runtime_router_module);
     trpc_tests.root_module.addImport("grpc_router", grpc_router_module);
-    trpc_tests.root_module.addImport("framework", framework_module);
+    trpc_tests.root_module.addImport("spice", spice_dep.module("spice"));
 
-    const run_framework_tests = b.addRunArtifact(framework_tests);
     const run_trpc_tests = b.addRunArtifact(trpc_tests);
-
-    const test_framework_step = b.step("test-framework", "Run framework tests");
-    test_framework_step.dependOn(&run_framework_tests.step);
-
-    const test_trpc_step = b.step("test-trpc", "Run tRPC tests");
-    test_trpc_step.dependOn(&run_trpc_tests.step);
-
-    // Original tests
-    const main_tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/main.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    main_tests.root_module.addImport("spice", spice_dep.module("spice"));
-
-    const run_main_tests = b.addRunArtifact(main_tests);
-    // Integration tests
-    const integration_tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/framework/tests.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    integration_tests.root_module.addImport("framework", framework_module);
-    integration_tests.root_module.addImport("spice", spice_dep.module("spice"));
-    
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    const test_integration_step = b.step("test-integration", "Run integration tests");
-    test_integration_step.dependOn(&run_integration_tests.step);
-
-    // Main test step that runs all tests
-    const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_main_tests.step);
     test_step.dependOn(&run_trpc_tests.step);
 
-    // Benchmark CLI executable
-    const benchmark_cli = b.addExecutable(.{
-        .name = "benchmark",
-        .root_source_file = .{ .cwd_relative = "src/benchmark_cli.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(benchmark_cli);
-
-    // Benchmark step
-    const bench_step = b.step("bench", "Run HTTP benchmarks");
-    const run_bench = b.addRunArtifact(benchmark_cli);
-    bench_step.dependOn(&run_bench.step);
+    // Run step
+    const run_step = b.step("run", "Run the server executable");
+    run_step.dependOn(&run_server_cmd.step);
 }

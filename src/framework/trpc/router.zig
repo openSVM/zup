@@ -1,8 +1,9 @@
 const std = @import("std");
 const json = std.json;
-const core = @import("../core.zig");
+const core = @import("core");
+const Schema = @import("schema").Schema;
+const Server = @import("framework").Server;
 const Procedure = @import("./procedure.zig").Procedure;
-const Schema = @import("./schema.zig").Schema;
 
 pub const Router = struct {
     allocator: std.mem.Allocator,
@@ -51,14 +52,14 @@ pub const Router = struct {
         });
     }
 
-    pub fn mount(self: *Self, server: *@import("../server.zig").Server) !void {
+    pub fn mount(self: *Self, server: *Server) !void {
         try server.addRoute(.POST, "/trpc/:procedure", handleRequest, self);
     }
 
     fn handleRequest(
         ctx: *core.Context,
-        request: *@import("../server.zig").Request,
-        response: *@import("../server.zig").Response,
+        request: *Server.Request,
+        response: *Server.Response,
         router: *Self,
     ) !void {
         const procedure_name = request.params.get("procedure").?;

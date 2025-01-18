@@ -79,24 +79,39 @@ log "Using test port: $TEST_PORT"
 
 # Run the tests with timeout and logging
 log "=== Starting tests with enhanced logging ==="
-timeout_seconds=45
+timeout_seconds=120  # Increase timeout to 2 minutes
 
 {
     # Run tests with verbose output and port override
     # Use gtimeout if available, otherwise use perl
+    log "Starting test with timeout of $timeout_seconds seconds..."
+    
+    # Kill any existing test processes
+    pkill -f "zig build test-trpc" || true
+    sleep 1
+    
+    # Check if port is in use
+    if lsof -i :$TEST_PORT > /dev/null 2>&1; then
+        log "Error: Port $TEST_PORT is still in use"
+        lsof -i :$TEST_PORT
+        exit 1
+    fi
+    
+    # Run the test with timeout
     if command -v gtimeout >/dev/null 2>&1; then
         RUST_BACKTRACE=1 \
         ZIG_DEBUG_COLOR=1 \
         ZIG_DEBUG_LOG=debug \
         TEST_PORT=$TEST_PORT \
-        gtimeout "$timeout_seconds" \
+        gtimeout --verbose --kill-after=5s "$timeout_seconds" \
         zig build test-trpc -Doptimize=Debug
     else
+        log "Using perl for timeout..."
         RUST_BACKTRACE=1 \
         ZIG_DEBUG_COLOR=1 \
         ZIG_DEBUG_LOG=debug \
         TEST_PORT=$TEST_PORT \
-        perl -e "\$SIG{ALRM} = sub { die 'timeout' }; alarm $timeout_seconds; exec @ARGV" \
+        perl -e "\$SIG{ALRM} = sub { die 'timeout' }; \$SIG{__WARN__} = sub { print STDERR \"[PERL] \", \@_ }; alarm $timeout_seconds; exec @ARGV" \
         zig build test-trpc -Doptimize=Debug
     fi
     

@@ -1,6 +1,6 @@
 const std = @import("std");
 const json = std.json;
-const Schema = @import("./schema.zig").Schema;
+const Schema = @import("schema").Schema;
 
 pub fn validateSchema(value: json.Value, schema: *const Schema) !void {
     switch (schema.object) {

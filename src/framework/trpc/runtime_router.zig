@@ -1,130 +1,189 @@
 const std = @import("std");
-const json = std.json;
 const core = @import("core");
-const Schema = @import("schema").Schema;
-
-pub const RuntimeProcedure = struct {
-    handler: *const fn (*core.Context, ?json.Value) anyerror!json.Value,
-};
+const json = std.json;
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
 pub const RuntimeRouter = struct {
-    allocator: std.mem.Allocator,
-    procedures: std.StringHashMap(RuntimeProcedure),
-    input_schemas: std.StringHashMap(Schema),
-    output_schemas: std.StringHashMap(Schema),
-    max_input_tokens: usize = 4096,
-    max_output_tokens: usize = 4096,
-
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    const Procedure = struct {
+        name: []const u8,
+        input_schema: ?[]const u8,
+        output_schema: ?[]const u8,
+        handler_fn: *const fn (*core.Context, ?json.Value) anyerror!json.Value,
+    };
+
+    procedures: std.StringHashMap(Procedure),
+    middlewares: std.ArrayList(core.Middleware),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Self {
         return .{
+            .procedures = std.StringHashMap(Procedure).init(allocator),
+            .middlewares = std.ArrayList(core.Middleware).init(allocator),
             .allocator = allocator,
-            .procedures = std.StringHashMap(RuntimeProcedure).init(allocator),
-            .input_schemas = std.StringHashMap(Schema).init(allocator),
-            .output_schemas = std.StringHashMap(Schema).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // First deinitialize the schemas since they reference the keys
-        self.input_schemas.deinit();
-        self.output_schemas.deinit();
-
-        // Then free the procedure keys and deinit the procedures map
         var it = self.procedures.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.input_schema) |schema| {
+                self.allocator.free(schema);
+            }
+            if (entry.value_ptr.output_schema) |schema| {
+                self.allocator.free(schema);
+            }
         }
         self.procedures.deinit();
+
+        for (self.middlewares.items) |*middleware| {
+            middleware.deinit();
+        }
+        self.middlewares.deinit();
     }
 
     pub fn procedure(
         self: *Self,
         name: []const u8,
-        handler: *const fn (*core.Context, ?json.Value) anyerror!json.Value,
-        input_schema: ?Schema,
-        output_schema: ?Schema,
+        input_schema: ?[]const u8,
+        output_schema: ?[]const u8,
+        handler_fn: *const fn (*core.Context, ?json.Value) anyerror!json.Value,
     ) !void {
-        const owned_name = try self.allocator.dupe(u8, name);
-        errdefer {
-            // Only free if we haven't successfully put it in procedures
-            if (!self.procedures.contains(owned_name)) {
-                self.allocator.free(owned_name);
-            }
-        }
+        const name_owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_owned);
 
-        // Try to put in procedures first
-        if (try self.procedures.fetchPut(owned_name, .{ .handler = handler })) |_| {
-            // If we're replacing an existing entry, we need to free our new key
-            self.allocator.free(owned_name);
-            return error.ProcedureAlreadyExists;
-        }
+        const input_schema_owned = if (input_schema) |schema| try self.allocator.dupe(u8, schema) else null;
+        errdefer if (input_schema_owned) |schema| self.allocator.free(schema);
 
-        // From this point on, owned_name is owned by the procedures map
-        errdefer {
-            _ = self.procedures.remove(owned_name);
-        }
+        const output_schema_owned = if (output_schema) |schema| try self.allocator.dupe(u8, schema) else null;
+        errdefer if (output_schema_owned) |schema| self.allocator.free(schema);
 
-        if (input_schema) |schema| {
-            try self.input_schemas.put(owned_name, schema);
-        }
-
-        if (output_schema) |schema| {
-            try self.output_schemas.put(owned_name, schema);
-        }
-    }
-
-    pub fn handleRequest(router: *Self, ctx: *core.Context) !void {
-        const procedure_name = ctx.params.get("procedure").?;
-        const proc = router.procedures.get(procedure_name) orelse {
-            return error.ProcedureNotFound;
+        const proc = Procedure{
+            .name = name_owned,
+            .input_schema = input_schema_owned,
+            .output_schema = output_schema_owned,
+            .handler_fn = handler_fn,
         };
 
-        // Parse and validate request body
-        const parsed = try json.parseFromSlice(json.Value, router.allocator, ctx.request.body, .{});
-        defer parsed.deinit();
+        try self.procedures.put(name_owned, proc);
+    }
 
-        // Validate input schema if present
-        if (router.input_schemas.get(procedure_name)) |*schema| {
-            try validateSchema(parsed.value.object.get("params") orelse return error.InvalidParams, schema);
-        }
+    pub fn use(self: *Self, middleware: core.Middleware) !void {
+        try self.middlewares.append(middleware);
+    }
 
-        // Call procedure handler
-        const result = try proc.handler(ctx, parsed.value.object.get("params"));
-
-        // Validate output schema if present
-        if (router.output_schemas.get(procedure_name)) |*schema| {
-            try validateSchema(result, schema);
-        }
-
-        // Create response object
-        var arena = std.heap.ArenaAllocator.init(router.allocator);
+    pub fn handleRequest(self: *Self, ctx: *core.Context) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
+        const body = ctx.request.body;
+        std.debug.print("Request body: {s}\n", .{body});
+
+        if (body.len == 0) {
+            return error.InvalidRequest;
+        }
+
+        // Skip any whitespace at the start of the body
+        var body_start: usize = 0;
+        while (body_start < body.len and std.ascii.isWhitespace(body[body_start])) {
+            body_start += 1;
+        }
+        if (body_start >= body.len) {
+            return error.InvalidRequest;
+        }
+
+        const json_body = body[body_start..];
+        std.debug.print("JSON body: {s}\n", .{json_body});
+
+        var parsed = try std.json.parseFromSlice(
+            json.Value,
+            arena.allocator(),
+            json_body,
+            .{},
+        );
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) {
+            std.debug.print("Invalid root type: {}\n", .{root});
+            return error.InvalidRequest;
+        }
+
+        const method = root.object.get("method") orelse return error.MissingMethod;
+        if (method != .string) return error.InvalidMethod;
+        const method_str = method.string;
+        std.debug.print("Method: {s}\n", .{method_str});
+
+        const proc = self.procedures.get(method_str) orelse return error.MissingProcedure;
+        const request_id = root.object.get("id");
+
+        if (proc.input_schema != null) {
+            const params = root.object.get("params") orelse return error.MissingParams;
+            if (params != .object) return error.InvalidParams;
+            std.debug.print("Params: {}\n", .{params});
+        }
+
+        // Call handler with params and get result
+        const result = try proc.handler_fn(ctx, root.object.get("params"));
+        std.debug.print("Result: {}\n", .{result});
+
+        // Construct response with id and result
         var response_obj = std.json.ObjectMap.init(arena.allocator());
-        try response_obj.put("id", parsed.value.object.get("id") orelse json.Value{ .null = {} });
+        try response_obj.put("id", request_id orelse json.Value{ .null = {} });
         try response_obj.put("result", result);
 
-        const response_value = std.json.Value{ .object = response_obj };
+        const response_value = json.Value{ .object = response_obj };
         try ctx.json(response_value);
     }
 
-    pub fn mount(self: *Self, server: *@import("framework").Server) !void {
-        const RouterContext = struct {
-            router: *Self,
+    const RouterHandler = struct {
+        router: *RuntimeRouter,
+        current_middleware: usize,
 
-            pub fn handle(ctx: *core.Context) anyerror!void {
-                const router_ctx = @as(*@This(), @ptrCast(@alignCast(ctx.data.?)));
-                try router_ctx.router.handleRequest(ctx);
+        fn init(router: *RuntimeRouter) @This() {
+            return .{
+                .router = router,
+                .current_middleware = 0,
+            };
+        }
+
+        fn nextFn(ctx: *core.Context) anyerror!void {
+            if (HandlerContext.current_handler) |handler_instance| {
+                try handler_instance.next(ctx);
             }
-        };
+        }
 
-        const router_ctx = try self.allocator.create(RouterContext);
-        router_ctx.* = .{ .router = self };
+        pub fn next(self: *@This(), ctx: *core.Context) !void {
+            if (self.current_middleware < self.router.middlewares.items.len) {
+                const middleware = &self.router.middlewares.items[self.current_middleware];
+                self.current_middleware += 1;
+                HandlerContext.current_handler = self;
+                try middleware.handle(ctx, nextFn);
+            } else {
+                try self.router.handleRequest(ctx);
+            }
+        }
+    };
 
-        try server.post("/trpc/:procedure", RouterContext.handle, router_ctx);
+    const HandlerContext = struct {
+        var router_instance: ?*Self = null;
+        var current_handler: ?*RouterHandler = null;
+
+        pub fn handle(ctx: *core.Context) !void {
+            if (router_instance) |router| {
+                var handler_state = RouterHandler.init(router);
+                try handler_state.next(ctx);
+            } else {
+                return error.RouterNotInitialized;
+            }
+        }
+    };
+
+    pub fn handler(self: *Self) *const fn (*core.Context) anyerror!void {
+        HandlerContext.router_instance = self;
+        return &HandlerContext.handle;
     }
 };
-
-const validateSchema = @import("schema").validateSchema;

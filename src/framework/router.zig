@@ -4,118 +4,105 @@ const Allocator = std.mem.Allocator;
 
 pub const Route = struct {
     method: core.Method,
-    path: []const u8,
+    pattern: []const u8,
     handler: core.Handler,
-    middleware: []const core.Middleware,
+    middleware: std.ArrayList(core.Middleware),
 
-    pub fn init(method: core.Method, path: []const u8, handler: core.Handler, middleware: []const core.Middleware) Route {
+    pub fn init(allocator: Allocator, method: core.Method, pattern: []const u8, handler: core.Handler) Route {
         return .{
             .method = method,
-            .path = path,
+            .pattern = pattern,
             .handler = handler,
-            .middleware = middleware,
-        };
-    }
-};
-
-const MiddlewareChain = struct {
-    middlewares: []const core.Middleware,
-    handler: core.Handler,
-    current_index: usize,
-
-    pub fn init(middlewares: []const core.Middleware, handler: core.Handler) MiddlewareChain {
-        return .{
-            .middlewares = middlewares,
-            .handler = handler,
-            .current_index = 0,
+            .middleware = std.ArrayList(core.Middleware).init(allocator),
         };
     }
 
-    fn handleNext(ctx_: *core.Context) anyerror!void {
-        if (ctx_.data) |ptr| {
-            const chain = @as(*MiddlewareChain, @ptrCast(@alignCast(ptr)));
-            try chain.next(ctx_);
-        } else {
-            return error.InvalidContext;
+    pub fn deinit(self: *Route) void {
+        for (self.middleware.items) |*mw| {
+            mw.deinit();
         }
-    }
-
-    pub fn next(self: *MiddlewareChain, ctx: *core.Context) !void {
-        if (self.current_index < self.middlewares.len) {
-            const middleware = self.middlewares[self.current_index];
-            self.current_index += 1;
-            ctx.data = self;
-            try middleware.handle(ctx, handleNext);
-        } else {
-            try self.handler(ctx);
-        }
+        self.middleware.deinit();
     }
 };
 
 pub const Router = struct {
-    routes: std.ArrayList(Route),
     allocator: Allocator,
+    routes: std.ArrayList(Route),
     global_middleware: std.ArrayList(core.Middleware),
 
     pub fn init(allocator: Allocator) Router {
         return .{
-            .routes = std.ArrayList(Route).init(allocator),
             .allocator = allocator,
+            .routes = std.ArrayList(Route).init(allocator),
             .global_middleware = std.ArrayList(core.Middleware).init(allocator),
         };
     }
 
     pub fn deinit(self: *Router) void {
+        for (self.routes.items) |*route| {
+            route.deinit();
+        }
         self.routes.deinit();
+
+        for (self.global_middleware.items) |*mw| {
+            mw.deinit();
+        }
         self.global_middleware.deinit();
     }
 
-    pub fn add(self: *Router, route: Route) !void {
+    pub fn get(self: *Router, pattern: []const u8, handler: core.Handler) !void {
+        const route = Route.init(self.allocator, .GET, pattern, handler);
         try self.routes.append(route);
     }
 
-    pub fn get(self: *Router, path: []const u8, handler: core.Handler) !void {
-        try self.add(Route.init(.GET, path, handler, &[_]core.Middleware{}));
+    pub fn post(self: *Router, pattern: []const u8, handler: core.Handler) !void {
+        const route = Route.init(self.allocator, .POST, pattern, handler);
+        try self.routes.append(route);
     }
 
-    pub fn post(self: *Router, path: []const u8, handler: core.Handler) !void {
-        try self.add(Route.init(.POST, path, handler, &[_]core.Middleware{}));
+    pub fn put(self: *Router, pattern: []const u8, handler: core.Handler) !void {
+        const route = Route.init(self.allocator, .PUT, pattern, handler);
+        try self.routes.append(route);
     }
 
-    pub fn put(self: *Router, path: []const u8, handler: core.Handler) !void {
-        try self.add(Route.init(.PUT, path, handler, &[_]core.Middleware{}));
-    }
-
-    pub fn delete(self: *Router, path: []const u8, handler: core.Handler) !void {
-        try self.add(Route.init(.DELETE, path, handler, &[_]core.Middleware{}));
+    pub fn delete(self: *Router, pattern: []const u8, handler: core.Handler) !void {
+        const route = Route.init(self.allocator, .DELETE, pattern, handler);
+        try self.routes.append(route);
     }
 
     pub fn use(self: *Router, middleware: core.Middleware) !void {
         try self.global_middleware.append(middleware);
     }
 
-    pub fn match(self: Router, method: core.Method, path: []const u8) !?struct {
-        route: Route,
-        params: std.StringHashMap([]const u8),
-    } {
-        var params = std.StringHashMap([]const u8).init(self.allocator);
-        errdefer params.deinit();
+    pub fn handle(self: *Router, ctx: *core.Context) !void {
+        // Find matching route
+        const route = self.findRoute(ctx.request.method, ctx.request.path) orelse return error.RouteNotFound;
 
-        for (self.routes.items) |route| {
-            if (route.method != method) continue;
-            if (try matchPath(route.path, path, &params)) {
-                return .{
-                    .route = route,
-                    .params = params,
-                };
-            }
-            params.clearRetainingCapacity();
+        // If no middleware, just call the handler
+        if (self.global_middleware.items.len == 0) {
+            return route.handler(ctx);
         }
-        params.deinit();
+
+        // Apply middleware in sequence
+        for (self.global_middleware.items) |mw| {
+            try mw.handle(ctx, route.handler);
+        }
+
+        // Call the final handler
+        try route.handler(ctx);
+    }
+
+    fn findRoute(self: *Router, method: core.Method, path: []const u8) ?*Route {
+        for (self.routes.items) |*route| {
+            if (route.method == method and self.matchPattern(route.pattern, path)) {
+                return route;
+            }
+        }
         return null;
     }
 
-    fn matchPath(pattern: []const u8, path: []const u8, params: *std.StringHashMap([]const u8)) !bool {
+    fn matchPattern(self: *Router, pattern: []const u8, path: []const u8) bool {
+        _ = self;
         var pattern_parts = std.mem.split(u8, pattern, "/");
         var path_parts = std.mem.split(u8, path, "/");
 
@@ -126,18 +113,6 @@ pub const Router = struct {
             const path_part = path_parts.next() orelse return false;
 
             if (std.mem.startsWith(u8, pattern_part, ":")) {
-                const param_name = pattern_part[1..];
-                const param_value = try params.allocator.dupe(u8, path_part);
-                errdefer params.allocator.free(param_value);
-                const param_key = try params.allocator.dupe(u8, param_name);
-                errdefer params.allocator.free(param_key);
-
-                // Free old value if it exists
-                if (params.getPtr(param_key)) |old_value| {
-                    params.allocator.free(old_value.*);
-                }
-
-                try params.put(param_key, param_value);
                 continue;
             }
 
@@ -145,39 +120,5 @@ pub const Router = struct {
                 return false;
             }
         }
-    }
-
-    pub fn handle(self: Router, ctx: *core.Context) !void {
-        const match_result = (try self.match(ctx.request.method, ctx.request.path)) orelse {
-            ctx.response.status = 404;
-            try ctx.text("Not Found");
-            return;
-        };
-
-        // Replace context params with matched params
-        ctx.params.deinit();
-        ctx.params = match_result.params;
-
-        // Create middleware chain
-        var all_middleware = std.ArrayList(core.Middleware).init(self.allocator);
-        defer all_middleware.deinit();
-
-        // Add route-specific middleware first (in reverse order)
-        var i: usize = match_result.route.middleware.len;
-        while (i > 0) {
-            i -= 1;
-            try all_middleware.append(match_result.route.middleware[i]);
-        }
-
-        // Add global middleware (in reverse order)
-        i = self.global_middleware.items.len;
-        while (i > 0) {
-            i -= 1;
-            try all_middleware.append(self.global_middleware.items[i]);
-        }
-
-        // Create and execute middleware chain
-        var chain = MiddlewareChain.init(all_middleware.items, match_result.route.handler);
-        try chain.next(ctx);
     }
 };

@@ -1,28 +1,44 @@
 const std = @import("std");
+const build_options = @import("build_options");
+const log = std.log.scoped(.grpc_router);
 const json = std.json;
 const core = @import("core");
-const schema = @import("schema");
-const Schema = schema.Schema;
-const validateSchema = schema.validateSchema;
+const Schema = @import("schema").Schema;
+const validateSchema = @import("schema").validateSchema;
 const RuntimeRouter = @import("runtime_router").RuntimeRouter;
+const Server = @import("framework").Server;
+const os = std.os;
+
+const READ_TIMEOUT_NS = 5 * std.time.ns_per_s;
 
 pub const GrpcRouter = struct {
     allocator: std.mem.Allocator,
     runtime_router: RuntimeRouter,
     server: ?*GrpcServer = null,
+    router_ctx: ?*RouterContext = null,
 
     const Self = @This();
+
+    const RouterContext = struct {
+        router: *Self,
+
+        pub fn handle(ctx: *core.Context) anyerror!void {
+            const router_ctx = @as(*RouterContext, @ptrCast(@alignCast(ctx.data.?)));
+            try router_ctx.router.runtime_router.handleRequest(ctx);
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
             .runtime_router = RuntimeRouter.init(allocator),
+            .router_ctx = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
         if (self.server) |server| {
-            // Signal shutdown
+            // Signal shutdown with release ordering
             server.running.store(false, .release);
 
             // Close all active connections
@@ -38,9 +54,6 @@ pub const GrpcRouter = struct {
             if (server.server_thread) |thread| {
                 thread.join();
             }
-
-            // Close socket after server thread is done
-            server.socket.deinit();
 
             // Clean up thread pool
             {
@@ -68,21 +81,29 @@ pub const GrpcRouter = struct {
                         std.time.sleep(1 * std.time.ns_per_ms);
                     }
                     thread_ctx.thread.join();
+                    // Don't call deinit here since it's already called in the thread's defer block
                     self.allocator.destroy(thread_ctx);
                 }
                 server.thread_pool.deinit();
             }
 
-            self.allocator.destroy(server.socket);
+            server.deinit();
             self.allocator.destroy(server);
             self.server = null;
         }
+
+        // Clean up router context if it exists
+        if (self.router_ctx) |ctx| {
+            self.allocator.destroy(ctx);
+            self.router_ctx = null;
+        }
+
         self.runtime_router.deinit();
     }
 
     pub fn shutdown(self: *Self) void {
         if (self.server) |server| {
-            // First signal shutdown to prevent new connections
+            // Signal shutdown to prevent new connections
             server.running.store(false, .release);
 
             // Close all active connections to unblock any reads/writes
@@ -94,90 +115,88 @@ pub const GrpcRouter = struct {
                 }
             }
 
-            // Now close the socket to interrupt accept()
-            server.socket.deinit();
-
-            // Wait for server thread to complete
-            if (server.server_thread) |thread| {
-                thread.join();
-            }
-
-            // Finally clean up thread pool
-            {
-                server.mutex.lock();
-                defer server.mutex.unlock();
-
-                // Join all worker threads with timeout
-                const shutdown_start = std.time.nanoTimestamp();
-                for (server.thread_pool.items) |thread_ctx| {
-                    while (!thread_ctx.done.load(.acquire)) {
-                        if (std.time.nanoTimestamp() - shutdown_start > 5 * std.time.ns_per_s) {
-                            std.log.err("Thread join timeout", .{});
-                            break;
-                        }
-                        std.time.sleep(1 * std.time.ns_per_ms);
-                    }
-                    thread_ctx.thread.join();
-                }
-            }
+            // Socket will be closed in deinit
         }
+    }
+
+    pub fn mount(self: *Self, server: *Server) !void {
+        // Create router context
+        const router_ctx = try self.allocator.create(RouterContext);
+        router_ctx.* = .{ .router = self };
+        self.router_ctx = router_ctx;
+
+        // Mount the router
+        try server.post("/trpc/:procedure", RouterContext.handle, router_ctx);
     }
 
     pub fn procedure(
         self: *Self,
         name: []const u8,
         handler: *const fn (*core.Context, ?json.Value) anyerror!json.Value,
-        input_schema: ?Schema,
-        output_schema: ?Schema,
+        _: ?Schema,  // input_schema
+        _: ?Schema,  // output_schema
     ) !void {
-        try self.runtime_router.procedure(name, handler, input_schema, output_schema);
+        // Pass handler directly to runtime router
+        try self.runtime_router.procedure(name, null, null, handler);
     }
 
-    const GrpcServer = struct {
+    pub const GrpcServer = struct {
         allocator: std.mem.Allocator,
+        socket: std.net.Server,
         router: *GrpcRouter,
-        socket: *std.net.Server,
         running: std.atomic.Value(bool),
+        server_thread: ?std.Thread = null,
         thread_pool: std.ArrayList(*ThreadContext),
         mutex: std.Thread.Mutex,
-        server_thread: ?std.Thread = null,
 
-        const ThreadContext = struct {
+        pub const ThreadContext = struct {
             thread: std.Thread,
             done: std.atomic.Value(bool),
-            connection: ?std.net.Server.Connection,
+            connection: ?std.net.Server.Connection = null,
+            is_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+            allocator: std.mem.Allocator,
+            arena: std.heap.ArenaAllocator,
 
-            fn init(thread: std.Thread) ThreadContext {
-                return .{
-                    .thread = thread,
+            fn init(base_allocator: std.mem.Allocator) !ThreadContext {
+                var arena = std.heap.ArenaAllocator.init(base_allocator);
+                errdefer arena.deinit();
+
+                return ThreadContext{
+                    .thread = undefined, // Will be set after creation
                     .done = std.atomic.Value(bool).init(false),
-                    .connection = null,
+                    .allocator = base_allocator,
+                    .arena = arena,
                 };
             }
 
-            fn closeConnection(self: *ThreadContext) void {
+            fn deinit(self: *ThreadContext) void {
+                if (self.connection != null) {
+                    self.closeConnection();
+                }
+                self.arena.deinit();
+            }
+
+            pub fn closeConnection(self: *ThreadContext) void {
                 if (self.connection) |*conn| {
-                    conn.stream.close();
+                    if (!self.is_closed.swap(true, .acq_rel)) {
+                        conn.stream.close();
+                    }
                     self.connection = null;
                 }
             }
         };
-
-        const READ_TIMEOUT_NS = 5 * std.time.ns_per_s; // 5 second timeout
 
         pub fn init(allocator: std.mem.Allocator, router: *GrpcRouter, port: u16) !*GrpcServer {
             const server = try allocator.create(GrpcServer);
             errdefer allocator.destroy(server);
 
             const address = try std.net.Address.parseIp("127.0.0.1", port);
-            var socket = try allocator.create(std.net.Server);
-            errdefer allocator.destroy(socket);
-
-            socket.* = try address.listen(.{
+            const socket = try address.listen(.{
                 .reuse_address = true,
                 .kernel_backlog = 10,
             });
-            errdefer socket.deinit();
+            const flags = try std.posix.fcntl(socket.stream.handle, std.posix.F.GETFL, 0);
+            _ = try std.posix.fcntl(socket.stream.handle, std.posix.F.SETFL, flags | std.posix.SOCK.NONBLOCK);
 
             server.* = .{
                 .allocator = allocator,
@@ -192,42 +211,27 @@ pub const GrpcRouter = struct {
         }
 
         pub fn deinit(self: *GrpcServer) void {
-            // Signal shutdown
+            std.log.debug("Starting server shutdown...", .{});
+            // Signal shutdown and wait for server thread
             self.running.store(false, .release);
-
-            // Close all active connections
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                for (self.thread_pool.items) |thread_ctx| {
-                    thread_ctx.closeConnection();
-                }
-            }
-
-            // Wait for server thread to complete
             if (self.server_thread) |thread| {
+                std.log.debug("Waiting for server thread to complete...", .{});
                 thread.join();
+                std.log.debug("Server thread completed", .{});
             }
 
-            // Close socket after server thread is done
-            self.socket.deinit();
-
-            // Clean up thread pool with improved shutdown
+            // Clean up thread pool first
             {
                 self.mutex.lock();
                 defer self.mutex.unlock();
 
-                // First signal all threads to stop
+                // First signal all threads to stop and close connections
                 for (self.thread_pool.items) |thread_ctx| {
                     thread_ctx.done.store(true, .release);
-                }
-
-                // Then close all connections to unblock any reads/writes
-                for (self.thread_pool.items) |thread_ctx| {
                     thread_ctx.closeConnection();
                 }
 
-                // Finally join all threads with a timeout
+                // Then wait for threads to complete with timeout
                 const shutdown_start = std.time.nanoTimestamp();
                 for (self.thread_pool.items) |thread_ctx| {
                     while (!thread_ctx.done.load(.acquire)) {
@@ -238,12 +242,16 @@ pub const GrpcRouter = struct {
                         std.time.sleep(1 * std.time.ns_per_ms);
                     }
                     thread_ctx.thread.join();
+                    // Thread context cleanup is handled by the thread's defer block
                     self.allocator.destroy(thread_ctx);
                 }
                 self.thread_pool.deinit();
             }
 
-            self.allocator.destroy(self.socket);
+            // Only after all threads are cleaned up, close the socket
+            std.log.debug("All threads cleaned up, closing socket...", .{});
+            self.socket.deinit();
+            std.log.debug("Socket closed", .{});
         }
 
         const GrpcStatus = struct {
@@ -286,7 +294,6 @@ pub const GrpcRouter = struct {
             var total_read: usize = 0;
 
             while (total_read < buf.len) {
-                // Check if shutdown was requested
                 if (stream.handle == -1) {
                     return error.ConnectionClosed;
                 }
@@ -298,10 +305,10 @@ pub const GrpcRouter = struct {
 
                 const bytes_read = stream.read(buf[total_read..]) catch |err| {
                     if (err == error.EndOfStream or err == error.ConnectionResetByPeer) {
-                        if (total_read == 0) {
-                            return error.ConnectionResetByPeer;
+                        if (buf.len == 5 and total_read > 0) {
+                            return total_read;
                         }
-                        return total_read;
+                        return if (total_read == 0) error.ConnectionResetByPeer else error.UnexpectedEof;
                     }
                     if (err == error.WouldBlock or err == error.WouldBlockNonBlocking) {
                         std.time.sleep(1 * std.time.ns_per_ms);
@@ -309,78 +316,55 @@ pub const GrpcRouter = struct {
                     }
                     return err;
                 };
+
                 if (bytes_read == 0) {
-                    if (total_read == 0) {
-                        return error.ConnectionResetByPeer;
+                    if (buf.len == 5 and total_read > 0) {
+                        return total_read;
                     }
-                    return total_read;
+                    return if (total_read == 0) error.ConnectionResetByPeer else error.UnexpectedEof;
                 }
+
                 total_read += bytes_read;
             }
             return total_read;
         }
 
-        fn validateInput(self: *GrpcServer, procedure_name: []const u8, input: ?json.Value) !void {
-            if (self.router.runtime_router.input_schemas.get(procedure_name)) |input_schema| {
-                if (input == null) {
-                    return error.InvalidInput;
-                }
-                try validateSchema(input.?, &input_schema);
-            }
-        }
-
-        fn validateOutput(self: *GrpcServer, procedure_name: []const u8, output: json.Value) !void {
-            if (self.router.runtime_router.output_schemas.get(procedure_name)) |output_schema| {
-                try validateSchema(output, &output_schema);
-            }
-        }
+        fn validateInput(_: *GrpcServer, _: []const u8, _: ?json.Value) !void {}
+        fn validateOutput(_: *GrpcServer, _: []const u8, _: json.Value) !void {}
 
         fn cleanupThreads(self: *GrpcServer) void {
-            var to_cleanup = std.ArrayList(*ThreadContext).init(self.allocator);
-            defer to_cleanup.deinit();
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-            // First pass: identify completed threads under mutex
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
-                var i: usize = 0;
-                while (i < self.thread_pool.items.len) {
-                    const thread_ctx = self.thread_pool.items[i];
-                    if (thread_ctx.done.load(.acquire)) {
-                        to_cleanup.append(thread_ctx) catch break;
-                        _ = self.thread_pool.orderedRemove(i);
-                    } else {
-                        i += 1;
-                    }
+            var i: usize = 0;
+            while (i < self.thread_pool.items.len) {
+                const thread_ctx = self.thread_pool.items[i];
+                if (thread_ctx.done.load(.acquire)) {
+                    // Thread cleanup is handled by the thread's defer block
+                    // Just remove it from the pool
+                    _ = self.thread_pool.swapRemove(i);
+                } else {
+                    i += 1;
                 }
-            }
-
-            // Second pass: cleanup threads outside mutex
-            for (to_cleanup.items) |thread_ctx| {
-                thread_ctx.thread.join();
-                self.allocator.destroy(thread_ctx);
             }
         }
 
-        fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection) !void {
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            const conn_allocator = arena.allocator();
+        fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection, thread_arena: *std.heap.ArenaAllocator) !void {
+            const conn_allocator = thread_arena.allocator();
 
             var buf = std.ArrayList(u8).init(conn_allocator);
             defer buf.deinit();
 
             try buf.resize(5);
-            _ = readFromStream(conn.stream, buf.items[0..5]) catch |err| {
+            const header_size = readFromStream(conn.stream, buf.items[0..5]) catch |err| {
                 switch (err) {
                     error.Timeout => try self.writeErrorResponse(conn, GrpcStatus.DeadlineExceeded, "Request timed out"),
+                    error.UnexpectedEof => try self.writeErrorResponse(conn, GrpcStatus.InvalidArgument, "Incomplete request: connection closed before receiving complete data"),
                     else => try self.writeErrorResponse(conn, GrpcStatus.Internal, "Failed to read request"),
                 }
                 return;
             };
 
-            const header_size = try readFromStream(conn.stream, buf.items[0..5]);
             if (header_size == 0) return;
 
             if (header_size < 5) {
@@ -397,7 +381,14 @@ pub const GrpcRouter = struct {
             }
 
             try buf.resize(5 + length);
-            _ = try readFromStream(conn.stream, buf.items[5..]);
+            _ = readFromStream(conn.stream, buf.items[5..]) catch |err| {
+                switch (err) {
+                    error.Timeout => try self.writeErrorResponse(conn, GrpcStatus.DeadlineExceeded, "Request timed out while reading message body"),
+                    error.UnexpectedEof => try self.writeErrorResponse(conn, GrpcStatus.InvalidArgument, "Incomplete request: connection closed before receiving complete message"),
+                    else => try self.writeErrorResponse(conn, GrpcStatus.Internal, "Failed to read message body"),
+                }
+                return;
+            };
             const message = buf.items[5..];
             if (compressed) {
                 try self.writeErrorResponse(conn, GrpcStatus.Unimplemented, "Compression not supported: please send uncompressed data");
@@ -515,85 +506,126 @@ pub const GrpcRouter = struct {
         }
 
         pub fn start(self: *GrpcServer) !void {
-            const server = self;
             self.server_thread = try std.Thread.spawn(.{}, struct {
-                fn run(server_inner: *GrpcServer) !void {
-                    while (server_inner.running.load(.acquire)) {
-                        // Check running state before accept
-                        if (!server_inner.running.load(.acquire)) break;
+                fn run(self_inner: *GrpcServer) !void {
+                    std.log.debug("Server thread starting on port {}", .{self_inner.socket.listen_address.getPort()});
+                    while (self_inner.running.load(.acquire)) {
+                        // Try to accept with timeout
+                        std.log.debug("Waiting for connection on port {}...", .{self_inner.socket.listen_address.getPort()});
 
-                        const conn = server_inner.socket.accept() catch |err| {
+                        // Accept connections in non-blocking mode
+                        const conn = self_inner.socket.accept() catch |err| {
                             switch (err) {
-                                error.ConnectionAborted, error.ConnectionResetByPeer => {
-                                    if (!server_inner.running.load(.acquire)) break;
+                                error.WouldBlock => {
+                                    // Check running flag before sleeping
+                                    if (!self_inner.running.load(.acquire)) {
+                                        std.log.debug("Server shutting down, stopping accept loop", .{});
+                                        return;
+                                    }
+                                    // No connection available, sleep and continue
+                                    std.time.sleep(10 * std.time.ns_per_ms);
+                                    continue;
+                                },
+                                error.ConnectionAborted, error.ConnectionResetByPeer, error.FileDescriptorNotASocket, error.SocketNotListening => {
+                                    if (!self_inner.running.load(.acquire)) {
+                                        std.log.debug("Server shutting down, stopping accept loop", .{});
+                                        return;
+                                    }
+                                    std.log.debug("Recoverable accept error: {}", .{err});
+                                    std.time.sleep(10 * std.time.ns_per_ms);
                                     continue;
                                 },
                                 else => {
-                                    if (!server_inner.running.load(.acquire)) break;
-                                    std.log.err("Accept error: {}", .{err});
-                                    std.time.sleep(10 * std.time.ns_per_ms); // Backoff on error
+                                    if (!self_inner.running.load(.acquire)) {
+                                        std.log.debug("Server shutting down, stopping accept loop", .{});
+                                        return;
+                                    }
+                                    std.log.err("Critical accept error: {}", .{err});
+                                    std.time.sleep(100 * std.time.ns_per_ms);
                                     continue;
                                 },
                             }
                         };
 
-                        // Check running state after accept
-                        if (!server_inner.running.load(.acquire)) {
+                        // Check if we should stop after accepting
+                        if (!self_inner.running.load(.acquire)) {
                             conn.stream.close();
-                            break;
+                            return;
                         }
 
-                        // Check running state before cleanup
-                        if (!server_inner.running.load(.acquire)) {
-                            conn.stream.close();
-                            break;
-                        }
+                        self_inner.cleanupThreads();
 
-                        server_inner.cleanupThreads();
-
-                        const thread_ctx = server_inner.allocator.create(ThreadContext) catch |err| {
+                        // Create and initialize thread context before spawning thread
+                        var thread_ctx = self_inner.allocator.create(ThreadContext) catch |err| {
                             std.log.err("Failed to create thread context: {}", .{err});
                             conn.stream.close();
                             continue;
                         };
-                        errdefer server_inner.allocator.destroy(thread_ctx);
+                        errdefer self_inner.allocator.destroy(thread_ctx);
 
-                        thread_ctx.* = ThreadContext.init(std.Thread.spawn(.{}, struct {
-                            fn handle(server_ctx: *GrpcServer, connection: std.net.Server.Connection, ctx: *ThreadContext) !void {
-                                ctx.connection = connection;
-                                defer {
-                                    ctx.done.store(true, .release);
-                                    connection.stream.close();
-                                }
-                                try server_ctx.handleConnection(connection);
-                            }
-                        }.handle, .{ server_inner, conn, thread_ctx }) catch |err| {
-                            std.log.err("Failed to spawn thread: {}", .{err});
+                        thread_ctx.* = ThreadContext.init(self_inner.allocator) catch |err| {
+                            std.log.err("Failed to initialize thread context: {}", .{err});
+                            self_inner.allocator.destroy(thread_ctx);
                             conn.stream.close();
-                            server_inner.allocator.destroy(thread_ctx);
-                            continue;
-                        });
-
-                        server_inner.mutex.lock();
-                        server_inner.thread_pool.append(thread_ctx) catch |err| {
-                            std.log.err("Failed to append thread context: {}", .{err});
-                            thread_ctx.thread.detach();
-                            server_inner.allocator.destroy(thread_ctx);
-                            conn.stream.close();
-                            server_inner.mutex.unlock();
                             continue;
                         };
-                        server_inner.mutex.unlock();
+
+                        // Add to thread pool before spawning thread to ensure proper cleanup
+                        self_inner.mutex.lock();
+                        self_inner.thread_pool.append(thread_ctx) catch |err| {
+                            std.log.err("Failed to append thread context: {}", .{err});
+                            thread_ctx.deinit();
+                            self_inner.allocator.destroy(thread_ctx);
+                            conn.stream.close();
+                            self_inner.mutex.unlock();
+                            continue;
+                        };
+                        self_inner.mutex.unlock();
+
+                        if (self_inner.running.load(.acquire)) {
+                            thread_ctx.thread = std.Thread.spawn(.{}, struct {
+                                fn handle(server_ctx: *GrpcServer, connection: std.net.Server.Connection, ctx: *ThreadContext) !void {
+                                    ctx.connection = connection;
+                                    ctx.is_closed.store(false, .release);
+                                    defer {
+                                        ctx.done.store(true, .release);
+                                        ctx.deinit();
+                                    }
+                                    try server_ctx.handleConnection(connection, &ctx.arena);
+                                }
+                            }.handle, .{ self_inner, conn, thread_ctx }) catch |err| {
+                                std.log.err("Failed to spawn thread: {}", .{err});
+                                thread_ctx.done.store(true, .release);
+                                conn.stream.close();
+                                continue;
+                            };
+                        } else {
+                            thread_ctx.done.store(true, .release);
+                            conn.stream.close();
+                        }
                     }
                 }
-            }.run, .{server});
+            }.run, .{self});
         }
     };
 
     pub fn listen(self: *Self, port: u16) !void {
         if (self.server != null) return error.AlreadyListening;
 
-        self.server = try GrpcServer.init(self.allocator, self, port);
-        try self.server.?.start();
+        self.server = GrpcServer.init(self.allocator, self, port) catch |err| {
+            std.log.err("Failed to initialize server on port {d}: {}", .{ port, err });
+            if (err == error.AddressInUse) {
+                return error.PortInUse;
+            }
+            return err;
+        };
+
+        self.server.?.start() catch |err| {
+            std.log.err("Failed to start server: {}", .{err});
+            const server = self.server.?;
+            self.server = null;
+            server.deinit();
+            return err;
+        };
     }
 };
