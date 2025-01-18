@@ -193,7 +193,7 @@ test "trpc over grpc - basic procedure call" {
 
     std.debug.print("Starting server on random port...\n", .{});
     // Use TEST_PORT from environment if set, otherwise use random port
-    const port_str = std.os.getenv("TEST_PORT") orelse "0";
+    const port_str = std.process.getEnvVarOwned(allocator, "TEST_PORT") catch "0";
     const listen_port = try std.fmt.parseInt(u16, port_str, 10);
     try router.listen(listen_port);
     errdefer shutdownServer(&router);
@@ -284,7 +284,7 @@ test "trpc over grpc - concurrent calls with debug" {
     try router.procedure("counter", counterHandler, null, null);
 
     // Use TEST_PORT from environment if set, otherwise use random port
-    const port_str = std.os.getenv("TEST_PORT") orelse "0";
+    const port_str = std.process.getEnvVarOwned(allocator, "TEST_PORT") catch "0";
     const listen_port = try std.fmt.parseInt(u16, port_str, 10);
     try router.listen(listen_port);
 
