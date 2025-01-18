@@ -283,8 +283,10 @@ test "trpc over grpc - concurrent calls with debug" {
 
     try router.procedure("counter", counterHandler, null, null);
 
-    // Start server on random port
-    try router.listen(0);
+    // Use TEST_PORT from environment if set, otherwise use random port
+    const port_str = std.os.getenv("TEST_PORT") orelse "0";
+    const port = try std.fmt.parseInt(u16, port_str, 10);
+    try router.listen(port);
 
     // Get actual port and server
     const server = router.server.?;
