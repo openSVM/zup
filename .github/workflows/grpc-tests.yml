@@ -35,6 +35,13 @@ jobs:
         chmod +x scripts/run_grpc_tests.sh
         chmod +x scripts/test.sh
       
+    - name: Network validation
+      run: |
+        echo "=== Network Configuration ==="
+        ip addr
+        netstat -tulpn || true
+        ss -tulpn || true
+        
     - name: Build and run tests
       timeout-minutes: 5  # Set specific step timeout
       run: |
@@ -53,20 +60,27 @@ jobs:
           --progress=plain \
           .
         
+        # Create docker network
+        docker network create grpc-test-net || true
+        
         # Run tests with resource limits and timeout
         docker run \
           --rm \
           --memory=2g \
           --cpus=2 \
           --name opensvm-grpc-test \
-          --network host \
+          --network grpc-test-net \
           -e RUST_BACKTRACE=1 \
           -e ZIG_DEBUG_LOG=debug \
           -e TEST_PORT=8089 \
+          -p 8089:8089 \
           -v "$(pwd)/logs:/app/logs" \
           -v "$(pwd)/zig-cache:/app/zig-cache" \
           opensvm-grpc-test \
           bash -c "timeout 45s strace -f ./scripts/run_grpc_tests_local.sh 2>&1 | tee logs/strace.log"
+        
+        # Cleanup network
+        docker network rm grpc-test-net || true
           
         # Move cache
         rm -rf /tmp/.buildx-cache
