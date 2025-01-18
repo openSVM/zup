@@ -98,6 +98,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const log_level = b.option(
+        std.log.Level,
+        "log_level",
+        "The log level to use",
+    ) orelse .debug;
+    const build_options = b.addOptions();
+    build_options.addOption(std.log.Level, "log_level", log_level);
+    trpc_tests.root_module.addImport("build_options", build_options.createModule());
     trpc_tests.root_module.addImport("core", core_module);
     trpc_tests.root_module.addImport("schema", schema_module);
     trpc_tests.root_module.addImport("runtime_router", runtime_router_module);
