@@ -1,89 +1,84 @@
 #!/bin/bash
 
-# Exit on error and print commands
+# Exit on error and enable command printing
 set -ex
 
-echo "=== Running gRPC tests with timeout ==="
+echo "=== Running gRPC tests with enhanced logging ==="
 
-# Function to cleanup background processes
+# Create log directory
+mkdir -p logs
+log_file="logs/grpc_test_$(date +%Y%m%d_%H%M%S).log"
+
+# Function to log with timestamp
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$log_file"
+}
+
+# Function to cleanup processes
 cleanup() {
-    echo "=== Cleaning up processes ==="
-    # Kill the test process and its children
-    if [ ! -z "$test_pid" ]; then
-        echo "=== Killing test process $test_pid and children ==="
-        pkill -P $test_pid 2>/dev/null || true
-        kill $test_pid 2>/dev/null || true
+    log "Cleaning up processes..."
+    pkill -f "zig build test-trpc" || true
+    if [ -f "$log_file" ]; then
+        log "=== Final test log ==="
+        tail -n 50 "$log_file"
     fi
 }
 
 # Set trap for cleanup
 trap cleanup EXIT INT TERM
 
-# Create named pipe for real-time output
-pipe=$(mktemp -u)
-mkfifo "$pipe"
-temp_output=$(mktemp)
+# Print system info
+log "=== System Information ==="
+log "Operating System: $(uname -a)"
+log "Zig Version: $(zig version)"
+log "Available Memory: $(free -h 2>/dev/null || vm_stat 2>/dev/null || echo 'Memory info not available')"
+log "CPU Info: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 'CPU info not available')"
 
-# Start background process to show output in real-time while also capturing it
-cat "$pipe" | tee "$temp_output" &
-cat_pid=$!
+# Verify build files
+log "=== Verifying build files ==="
+ls -la build.zig build.zig.zon || log "Warning: Build files not found"
 
-timeout_seconds=30
-echo "=== Starting tests with ${timeout_seconds}s timeout ==="
+# Check Zig cache
+log "=== Checking Zig cache ==="
+ls -la "$(zig env | grep 'cache_dir' | cut -d= -f2)" 2>/dev/null || log "Warning: Zig cache not found"
 
-# Run test with debug output and runtime safety checks
+# Run the tests with timeout and logging
+log "=== Starting tests with enhanced logging ==="
+timeout_seconds=45
+
 {
-    # Print test command for debugging
-    echo "=== Running command: zig build test-trpc -Doptimize=Debug ==="
-    RUST_BACKTRACE=1 ZIG_DEBUG_COLOR=1 ZIG_DEBUG_LOG=debug zig build test-trpc -Doptimize=Debug 2>&1 | tee /dev/stderr
-} > "$pipe" &
-test_pid=$!
-
-echo "=== Test process started with PID: $test_pid ==="
-
-# Monitor test execution
-start_time=$(date +%s)
-while true; do
-    # Check if process is still running
-    if ! kill -0 $test_pid 2>/dev/null; then
-        # Process finished, get exit code
-        wait $test_pid
-        exit_code=$?
-        
-        # Clean up the pipe and background processes
-        kill $cat_pid 2>/dev/null || true
-        rm "$pipe" "$temp_output"
-        
-        if [ "$exit_code" = "0" ]; then
-            echo "=== Tests completed successfully! ==="
-            exit 0
-        else
-            echo "=== Tests failed with exit code: $exit_code ==="
-            # Show last few lines of output for context
-            echo "=== Last test output: ==="
-            tail -n 20 "$temp_output"
+    # Run tests with verbose output
+    RUST_BACKTRACE=1 \
+    ZIG_DEBUG_COLOR=1 \
+    ZIG_DEBUG_LOG=debug \
+    timeout "$timeout_seconds" \
+    zig build test-trpc -Doptimize=Debug -vv
+    
+    exit_code=$?
+    
+    case $exit_code in
+        0)
+            log "=== Tests completed successfully! ==="
+            ;;
+        124)
+            log "=== Tests timed out after $timeout_seconds seconds ==="
             exit 1
-        fi
-    fi
+            ;;
+        *)
+            log "=== Tests failed with exit code: $exit_code ==="
+            if [ -f "zig-cache/log.txt" ]; then
+                log "=== Zig build log ==="
+                tail -n 50 "zig-cache/log.txt"
+            fi
+            exit 1
+            ;;
+    esac
+} 2>&1 | tee -a "$log_file"
 
-    # Check timeout
-    current_time=$(date +%s)
-    elapsed=$((current_time - start_time))
-    if [ $elapsed -ge $timeout_seconds ]; then
-        echo "=== Tests timed out after $timeout_seconds seconds! ==="
-        echo "=== Last test output: ==="
-        tail -n 20 "$temp_output"
-        cleanup
-        kill $cat_pid 2>/dev/null || true
-        rm "$pipe" "$temp_output"
-        exit 2
-    fi
-
-    # Show progress without flooding output
-    if [ $((elapsed % 5)) = 0 ] && [ $elapsed -gt 0 ]; then
-        echo "=== Still running: ${elapsed}s elapsed ==="
-    fi
-
-    # Brief pause before next check
-    sleep 1
-done
+# Archive logs if tests failed
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    log_archive="logs/grpc_test_failed_$(date +%Y%m%d_%H%M%S).tar.gz"
+    tar -czf "$log_archive" "$log_file" zig-cache/log.txt 2>/dev/null || true
+    log "Logs archived to $log_archive"
+    exit 1
+fi
