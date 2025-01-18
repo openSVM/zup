@@ -105,8 +105,13 @@ fn copyFile(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !voi
 }
 
 const root_template =
-    \\pub const zup = @import("zup");
-    \\pub usingnamespace zup;
+    \\const zup = @import("zup");
+    \\
+    \\pub const core = zup.core;
+    \\pub const framework = zup.framework;
+    \\pub const schema = zup.schema;
+    \\pub const runtime_router = zup.runtime_router;
+    \\pub const grpc_router = zup.grpc_router;
 ;
 
 const grpc_main_template =
@@ -193,10 +198,6 @@ const build_zon_template =
     \\.{{
     \\    .name = "{s}",
     \\    .version = "0.1.0",
-const build_zon_template =
-    \\.{{
-    \\    .name = "{s}",
-    \\    .version = "0.1.0",
     \\    .paths = .{{
     \\        "src",
     \\        "build.zig",
@@ -204,7 +205,8 @@ const build_zon_template =
     \\    }},
     \\    .dependencies = .{{
     \\        .zup = .{{
-    \\            .path = "..",
+    \\            .url = "https://github.com/openSVM/zup/archive/main.tar.gz",
+    \\            .hash = "1220bc3ba76ebbba7f90b363409144a85b24ee584cde5139646a5c2038c09f4a3bfb",
     \\        }},
     \\    }},
     \\}}
@@ -212,6 +214,10 @@ const build_zon_template =
 
 fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u8) !void {
     print("Generating gRPC boilerplate for project '{s}'...\n", .{project_name});
+
+    // Create project directory
+    try createDirectory(project_name);
+
 
     // Create project directory
     try createDirectory(project_name);
