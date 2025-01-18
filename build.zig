@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     example.root_module.addImport("framework", framework_module);
+    example.root_module.addImport("core", core_module);
     b.installArtifact(example);
 
     // Example server run step
