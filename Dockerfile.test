@@ -1,14 +1,32 @@
 FROM debian:bullseye-slim
 
-RUN apt-get update && apt-get install -y     wget     xz-utils     && rm -rf /var/lib/apt/lists/*
+# Install required packages
+RUN apt-get update && apt-get install -y \
+    wget \
+    xz-utils \
+    procps \
+    strace \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Zig
-RUN wget https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz     && tar xf zig-linux-x86_64-0.11.0.tar.xz     && mv zig-linux-x86_64-0.11.0 /usr/local/zig     && rm zig-linux-x86_64-0.11.0.tar.xz
+RUN wget https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz \
+    && tar xf zig-linux-x86_64-0.11.0.tar.xz \
+    && mv zig-linux-x86_64-0.11.0 /usr/local/zig \
+    && rm zig-linux-x86_64-0.11.0.tar.xz
 
-ENV PATH="/usr/local/zig:/Users/lina/.moon/bin:/Users/lina/.wasmtime/bin:/Users/lina/.bun/bin:/Users/lina/.nvm/versions/node/v22.4.0/bin:/Users/lina/.nvm/versions/node/v22.4.0/bin:/Users/lina/.local/share/solana/install/active_release/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/Users/lina/.moon/bin:/Users/lina/.wasmtime/bin:/Users/lina/.bun/bin:/Users/lina/.nvm/versions/node/v22.4.0/bin:/Users/lina/.local/share/solana/install/active_release/bin:/Users/lina/.cargo/bin:/Users/lina/.sp1/bin:/Users/lina/.radicle/bin:/Users/lina/.local/bin:/Users/lina/.local/bin:/Users/lina/.local/bin"
+# Set up environment
+ENV PATH="/usr/local/zig:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV ZIG_DEBUG_LOG=debug
+ENV RUST_BACKTRACE=1
 
 WORKDIR /app
 COPY . .
 
+# Make scripts executable
+RUN chmod +x scripts/*.sh
+
 # Pre-build to catch any build errors early
-RUN zig build test -Doptimize=Debug
+RUN zig build test -Doptimize=Debug || (cat zig-cache/log.txt && exit 1)
+
+# Default command (can be overridden)
+CMD ["./scripts/run_grpc_tests_local.sh"]
