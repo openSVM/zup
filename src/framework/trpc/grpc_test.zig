@@ -198,8 +198,9 @@ test "trpc over grpc - basic procedure call" {
     try router.listen(port);
     errdefer shutdownServer(&router);
 
-    // Get server instance
+    // Get server instance and port
     const server = router.server.?;
+    const port = server.socket.listen_address.getPort();
 
     try waitForServer(allocator, port);
 
@@ -287,9 +288,8 @@ test "trpc over grpc - concurrent calls with debug" {
     const port = try std.fmt.parseInt(u16, port_str, 10);
     try router.listen(port);
 
-    // Get actual port and server
+    // Get server instance
     const server = router.server.?;
-    const port = server.socket.listen_address.getPort();
 
     try waitForServer(allocator, port);
 
