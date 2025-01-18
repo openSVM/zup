@@ -89,7 +89,7 @@ timeout_seconds=45
     ZIG_DEBUG_LOG=debug \
     TEST_PORT=$TEST_PORT \
     perl -e "\$SIG{ALRM} = sub { die 'timeout' }; alarm $timeout_seconds; exec @ARGV" \
-    zig build test-trpc -Doptimize=Debug --verbose
+    zig build test-trpc -Doptimize=Debug -Dlog_level=debug
     
     exit_code=$?
     
