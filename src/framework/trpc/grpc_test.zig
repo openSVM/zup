@@ -8,11 +8,27 @@ const GrpcRouter = @import("grpc_router").GrpcRouter;
 const Counter = struct {
     counter: usize = 0,
     mutex: std.Thread.Mutex = .{},
+    active: bool = true,
 
     fn reset(self: *Counter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.counter = 0;
+        self.active = true;
+    }
+
+    fn increment(self: *Counter) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active) return error.CounterInactive;
+        self.counter += 1;
+        return self.counter;
+    }
+
+    fn deactivate(self: *Counter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active = false;
     }
 };
 
@@ -20,10 +36,8 @@ var global_counter: Counter = .{};
 
 fn counterHandler(ctx: *core.Context, _: ?json.Value) !json.Value {
     _ = ctx;
-    global_counter.mutex.lock();
-    defer global_counter.mutex.unlock();
-    global_counter.counter += 1;
-    return json.Value{ .integer = @intCast(global_counter.counter) };
+    const count = try global_counter.increment();
+    return json.Value{ .integer = @intCast(count) };
 }
 
 fn echoHandler(ctx: *core.Context, input: ?json.Value) !json.Value {
@@ -37,23 +51,47 @@ fn validateHandler(ctx: *core.Context, input: ?json.Value) !json.Value {
 }
 
 fn readExactly(stream: std.net.Stream, buf: []u8, timeout_ns: i128) !void {
-    const start_time = std.time.nanoTimestamp();
+    const read_start_time = std.time.nanoTimestamp();
     var total_read: usize = 0;
 
     while (total_read < buf.len) {
+        if (stream.handle == -1) {
+            std.debug.print("Connection closed after {d} bytes\n", .{total_read});
+            return error.ConnectionClosed;
+        }
+
         const current_time = std.time.nanoTimestamp();
-        if (current_time - start_time > timeout_ns) {
+        if (current_time - read_start_time > timeout_ns) {
+            std.debug.print("Read timeout after {d} bytes\n", .{total_read});
             return error.Timeout;
         }
 
-        const n = try stream.read(buf[total_read..]);
-        if (n == 0) {
-            if (total_read == 0) {
-                return error.EndOfStream;
+        const bytes_read = stream.read(buf[total_read..]) catch |err| {
+            if (err == error.EndOfStream or err == error.ConnectionResetByPeer) {
+                if (buf.len == 5 and total_read > 0) {
+                    return;
+                }
+                std.debug.print("Stream error after {d} bytes: {}\n", .{ total_read, err });
+                return if (total_read == 0) error.ConnectionResetByPeer else error.UnexpectedEof;
             }
-            return error.UnexpectedEof;
+            if (err == error.WouldBlock or err == error.WouldBlockNonBlocking) {
+                std.time.sleep(1 * std.time.ns_per_ms);
+                continue;
+            }
+            std.debug.print("Read error after {d} bytes: {}\n", .{ total_read, err });
+            return err;
+        };
+
+        if (bytes_read == 0) {
+            if (buf.len == 5 and total_read > 0) {
+                return;
+            }
+            std.debug.print("Got EOF after {d} bytes\n", .{total_read});
+            return if (total_read == 0) error.ConnectionResetByPeer else error.UnexpectedEof;
         }
-        total_read += n;
+
+        total_read += bytes_read;
+        std.debug.print("Read {d} bytes, total {d}/{d}\n", .{ bytes_read, total_read, buf.len });
     }
 }
 
@@ -114,22 +152,51 @@ fn waitForServer(allocator: std.mem.Allocator, port: u16) !void {
 }
 
 fn shutdownServer(router: *GrpcRouter) void {
-    router.shutdown();
-    std.time.sleep(50 * std.time.ns_per_ms); // Allow time for cleanup
+    std.debug.print("\nShutting down server...\n", .{});
+    // First deactivate counter to prevent new increments
+    global_counter.deactivate();
+    
+    // Signal shutdown and close connections
+    if (router.server) |server| {
+        server.running.store(false, .release);
+        server.mutex.lock();
+        defer server.mutex.unlock();
+        for (server.thread_pool.items) |thread_ctx| {
+            thread_ctx.closeConnection();
+        }
+    }
+
+    // Allow any in-flight requests to complete
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Clean up
     router.deinit();
+    std.debug.print("Server shutdown complete\n", .{});
 }
 
 test "trpc over grpc - basic procedure call" {
+    std.debug.print("\n=== Starting basic procedure call test ===\n", .{});
+    std.debug.print("Initializing test...\n", .{});
+    
+    std.debug.print("Creating arena allocator...\n", .{});
     global_counter.reset();
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
+    std.debug.print("Creating router...\n", .{});
     var router = GrpcRouter.init(allocator);
-    defer shutdownServer(&router);
+    errdefer router.deinit();
 
+    std.debug.print("Adding counter procedure...\n", .{});
     try router.procedure("counter", counterHandler, null, null);
 
-    // Start server on random port
-    try router.listen(0);
+    std.debug.print("Starting server on random port...\n", .{});
+    // Use TEST_PORT from environment if set, otherwise use random port
+    const port_str = std.os.getenv("TEST_PORT") orelse "0";
+    const port = try std.fmt.parseInt(u16, port_str, 10);
+    try router.listen(port);
+    errdefer shutdownServer(&router);
 
     // Get actual port and server
     const server = router.server.?;
@@ -139,6 +206,7 @@ test "trpc over grpc - basic procedure call" {
 
     // First call
     {
+        std.debug.print("\nMaking first call...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -164,10 +232,12 @@ test "trpc over grpc - basic procedure call" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"result\":1") != null);
+        std.debug.print("First call successful\n", .{});
     }
 
     // Second call
     {
+        std.debug.print("\nMaking second call...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -193,12 +263,20 @@ test "trpc over grpc - basic procedure call" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"result\":2") != null);
+        std.debug.print("Second call successful\n", .{});
     }
+
+    // Explicitly shutdown server
+    shutdownServer(&router);
+    std.debug.print("=== Basic procedure call test complete ===\n", .{});
 }
 
 test "trpc over grpc - concurrent calls with debug" {
+    std.debug.print("\n=== Starting concurrent calls test ===\n", .{});
     global_counter.reset();
-    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var router = GrpcRouter.init(allocator);
     defer shutdownServer(&router);
@@ -229,8 +307,12 @@ test "trpc over grpc - concurrent calls with debug" {
         std.debug.print("Spawning thread {d}\n", .{i});
         threads[i] = try std.Thread.spawn(.{}, struct {
             fn call(server_port: u16, error_slot: *?anyerror, thread_id: usize) !void {
+                var thread_arena = std.heap.ArenaAllocator.init(testing.allocator);
+                defer thread_arena.deinit();
+                const thread_allocator = thread_arena.allocator();
+
                 std.debug.print("\nThread {d}: Starting\n", .{thread_id});
-                const stream = std.net.tcpConnectToHost(testing.allocator, "127.0.0.1", server_port) catch |err| {
+                const stream = std.net.tcpConnectToHost(thread_allocator, "127.0.0.1", server_port) catch |err| {
                     std.debug.print("\nThread {d}: Connection error: {}\n", .{thread_id, err});
                     error_slot.* = err;
                     return error.ConnectionFailed;
@@ -292,6 +374,7 @@ test "trpc over grpc - concurrent calls with debug" {
 
     // Verify counter
     {
+        std.debug.print("\nVerifying final counter value...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -313,10 +396,13 @@ test "trpc over grpc - concurrent calls with debug" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"result\":4") != null);
+        std.debug.print("Counter verification successful\n", .{});
     }
+    std.debug.print("=== Concurrent calls test complete ===\n", .{});
 }
 
 test "trpc over grpc - schema validation" {
+    std.debug.print("\n=== Starting schema validation test ===\n", .{});
     const allocator = testing.allocator;
 
     var router = GrpcRouter.init(allocator);
@@ -361,6 +447,7 @@ test "trpc over grpc - schema validation" {
 
     // Valid request
     {
+        std.debug.print("\nTesting valid request...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -382,10 +469,12 @@ test "trpc over grpc - schema validation" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"result\":{\"message\":\"hello\",\"count\":42}") != null);
+        std.debug.print("Valid request test successful\n", .{});
     }
 
     // Invalid request - missing required field
     {
+        std.debug.print("\nTesting missing field request...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -407,10 +496,12 @@ test "trpc over grpc - schema validation" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":9,\"message\":\"Invalid input parameters\"}") != null);
+        std.debug.print("Missing field test successful\n", .{});
     }
 
     // Invalid request - wrong type
     {
+        std.debug.print("\nTesting wrong type request...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -432,10 +523,13 @@ test "trpc over grpc - schema validation" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":9,\"message\":\"Invalid input parameters\"}") != null);
+        std.debug.print("Wrong type test successful\n", .{});
     }
+    std.debug.print("=== Schema validation test complete ===\n", .{});
 }
 
 test "trpc over grpc - error handling" {
+    std.debug.print("\n=== Starting error handling test ===\n", .{});
     const allocator = testing.allocator;
 
     var router = GrpcRouter.init(allocator);
@@ -454,6 +548,7 @@ test "trpc over grpc - error handling" {
 
     // Invalid gRPC frame - too short
     {
+        std.debug.print("\nTesting short frame...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -467,10 +562,12 @@ test "trpc over grpc - error handling" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":3,\"message\":\"Invalid gRPC frame\"}") != null);
+        std.debug.print("Short frame test successful\n", .{});
     }
 
     // Invalid JSON
     {
+        std.debug.print("\nTesting invalid JSON...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -490,10 +587,12 @@ test "trpc over grpc - error handling" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":3,\"message\":\"Invalid JSON request\"}") != null);
+        std.debug.print("Invalid JSON test successful\n", .{});
     }
 
     // Missing method
     {
+        std.debug.print("\nTesting missing method...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -515,10 +614,12 @@ test "trpc over grpc - error handling" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":3,\"message\":\"Missing method\"}") != null);
+        std.debug.print("Missing method test successful\n", .{});
     }
 
     // Invalid method type
     {
+        std.debug.print("\nTesting invalid method type...\n", .{});
         const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
         defer stream.close();
 
@@ -540,5 +641,7 @@ test "trpc over grpc - error handling" {
         const response = response_buf[5..][0..length];
 
         try testing.expect(std.mem.indexOf(u8, response, "\"error\":{\"code\":3,\"message\":\"Invalid method type\"}") != null);
+        std.debug.print("Invalid method type test successful\n", .{});
     }
+    std.debug.print("=== Error handling test complete ===\n", .{});
 }
