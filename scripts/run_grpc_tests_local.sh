@@ -33,6 +33,7 @@ log "Operating System: $(uname -a)"
 log "Zig Version: $(zig version)"
 log "Available Memory: $(free -h 2>/dev/null || vm_stat 2>/dev/null || echo 'Memory info not available')"
 log "CPU Info: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 'CPU info not available')"
+log "Network Info: $(ip addr show 2>/dev/null || ifconfig 2>/dev/null || echo 'Network info not available')"
 
 # Verify build files
 log "=== Verifying build files ==="
@@ -42,15 +43,20 @@ ls -la build.zig build.zig.zon || log "Warning: Build files not found"
 log "=== Checking Zig cache ==="
 ls -la "$(zig env | grep 'cache_dir' | cut -d= -f2)" 2>/dev/null || log "Warning: Zig cache not found"
 
+# Set test port from environment or default
+TEST_PORT=${TEST_PORT:-0}
+log "Using test port: $TEST_PORT"
+
 # Run the tests with timeout and logging
 log "=== Starting tests with enhanced logging ==="
 timeout_seconds=45
 
 {
-    # Run tests with verbose output
+    # Run tests with verbose output and port override
     RUST_BACKTRACE=1 \
     ZIG_DEBUG_COLOR=1 \
     ZIG_DEBUG_LOG=debug \
+    TEST_PORT=$TEST_PORT \
     timeout "$timeout_seconds" \
     zig build test-trpc -Doptimize=Debug -vv
     
@@ -62,6 +68,10 @@ timeout_seconds=45
             ;;
         124)
             log "=== Tests timed out after $timeout_seconds seconds ==="
+            # Dump network state on timeout
+            log "=== Network state at timeout ==="
+            netstat -an | grep LISTEN || true
+            ss -tulpn || true
             exit 1
             ;;
         *)
@@ -70,6 +80,10 @@ timeout_seconds=45
                 log "=== Zig build log ==="
                 tail -n 50 "zig-cache/log.txt"
             fi
+            # Dump network state on failure
+            log "=== Network state at failure ==="
+            netstat -an | grep LISTEN || true
+            ss -tulpn || true
             exit 1
             ;;
     esac
