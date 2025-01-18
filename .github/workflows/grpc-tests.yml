@@ -14,15 +14,41 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    
+    # Cache Docker layers
+    - name: Cache Docker layers
+      uses: actions/cache@v3
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
       
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+      with:
+        buildkitd-flags: --debug
+        
+    - name: Make scripts executable
+      run: |
+        chmod +x scripts/run_grpc_tests_local.sh
+        chmod +x scripts/run_grpc_tests.sh
+        chmod +x scripts/test.sh
       
     - name: Build and run tests
       timeout-minutes: 5  # Set specific step timeout
       run: |
-        # Build the test image
-        docker build -t opensvm-grpc-test -f Dockerfile.test .
+        # Enable debug output
+        set -x
+        
+        # Build the test image with cache
+        docker build \
+          --cache-from=type=local,src=/tmp/.buildx-cache \
+          --cache-to=type=local,dest=/tmp/.buildx-cache-new \
+          -t opensvm-grpc-test \
+          -f Dockerfile.test \
+          --progress=plain \
+          .
         
         # Run tests with resource limits and timeout
         docker run \
@@ -30,8 +56,14 @@ jobs:
           --memory=2g \
           --cpus=2 \
           --name opensvm-grpc-test \
+          -e RUST_BACKTRACE=1 \
+          -e ZIG_DEBUG_LOG=debug \
           opensvm-grpc-test \
           bash -c "timeout 45s ./scripts/run_grpc_tests_local.sh"
+          
+        # Move cache
+        rm -rf /tmp/.buildx-cache
+        mv /tmp/.buildx-cache-new /tmp/.buildx-cache
       
     - name: Upload test logs
       if: always()  # Upload logs even if tests fail
@@ -41,3 +73,4 @@ jobs:
         path: |
           zig-out/
           zig-cache/
+          /tmp/.buildx-cache
