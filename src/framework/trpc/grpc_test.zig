@@ -194,11 +194,11 @@ test "trpc over grpc - basic procedure call" {
     std.debug.print("Starting server on random port...\n", .{});
     // Use TEST_PORT from environment if set, otherwise use random port
     const port_str = std.os.getenv("TEST_PORT") orelse "0";
-    const port = try std.fmt.parseInt(u16, port_str, 10);
-    try router.listen(port);
+    const listen_port = try std.fmt.parseInt(u16, port_str, 10);
+    try router.listen(listen_port);
     errdefer shutdownServer(&router);
 
-    // Get server instance and port
+    // Get server instance and actual port
     const server = router.server.?;
     const port = server.socket.listen_address.getPort();
 
@@ -285,11 +285,12 @@ test "trpc over grpc - concurrent calls with debug" {
 
     // Use TEST_PORT from environment if set, otherwise use random port
     const port_str = std.os.getenv("TEST_PORT") orelse "0";
-    const port = try std.fmt.parseInt(u16, port_str, 10);
-    try router.listen(port);
+    const listen_port = try std.fmt.parseInt(u16, port_str, 10);
+    try router.listen(listen_port);
 
-    // Get server instance
+    // Get server instance and port
     const server = router.server.?;
+    const port = server.socket.listen_address.getPort();
 
     try waitForServer(allocator, port);
 
