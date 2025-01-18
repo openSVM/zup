@@ -1,3 +1,4 @@
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -166,4 +167,34 @@ pub fn build(b: *std.Build) void {
     // Run step
     const run_step = b.step("run", "Run the server executable");
     run_step.dependOn(&run_server_cmd.step);
+
+    // Export modules for other packages
+    _ = b.addModule("zup", .{
+        .root_source_file = .{ .cwd_relative = "src/root.zig" },
+        .imports = &.{
+            .{ .name = "spice", .module = spice_dep.module("spice") },
+            .{ .name = "core", .module = core_module },
+            .{ .name = "framework", .module = framework_module },
+            .{ .name = "schema", .module = schema_module },
+            .{ .name = "runtime_router", .module = runtime_router_module },
+            .{ .name = "grpc_router", .module = grpc_router_module },
+        },
+    });
+
+    // Add zup CLI tool
+    const zup_cli = b.addExecutable(.{
+        .name = "zup",
+        .root_source_file = .{ .cwd_relative = "zup.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(zup_cli);
+
+    const run_zup_cmd = b.addRunArtifact(zup_cli);
+    if (b.args) |args| {
+        run_zup_cmd.addArgs(args);
+    }
+    const run_zup_step = b.step("run-zup", "Run the zup CLI tool");
+    run_zup_step.dependOn(&run_zup_cmd.step);
+
 }
