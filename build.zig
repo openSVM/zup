@@ -44,14 +44,18 @@ pub fn build(b: *std.Build) void {
     });
 
     // API module
-    _ = b.addModule("zup-api", .{
+    const zup_api = b.addStaticLibrary(.{
+        .name = "zup-api",
         .root_source_file = .{ .cwd_relative = "src/root.zig" },
-        .imports = &.{
-            .{ .name = "core", .module = core_module },
-            .{ .name = "framework", .module = framework_module },
-            .{ .name = "schema", .module = schema_module },
-            .{ .name = "runtime_router", .module = runtime_router_module },
-            .{ .name = "grpc_router", .module = grpc_router_module },
-        },
+        .target = b.standardTargetOptions(.{}),
+        .optimize = b.standardOptimizeOption(.{}),
     });
+
+    zup_api.root_module.addImport("core", core_module);
+    zup_api.root_module.addImport("framework", framework_module);
+    zup_api.root_module.addImport("schema", schema_module);
+    zup_api.root_module.addImport("runtime_router", runtime_router_module);
+    zup_api.root_module.addImport("grpc_router", grpc_router_module);
+
+    b.installArtifact(zup_api);
 }

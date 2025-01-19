@@ -108,6 +108,31 @@ fn writeFile(path: []const u8, contents: []const u8) !void {
     try file.writeAll(contents);
 }
 
+fn copyDirectory(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+
+    try createDirectory(dst_path);
+
+    var it = src_dir.iterate();
+    while (try it.next()) |entry| {
+        const src_file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ src_path, entry.name });
+        defer allocator.free(src_file_path);
+        const dst_file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_path, entry.name });
+        defer allocator.free(dst_file_path);
+
+        switch (entry.kind) {
+            .file => {
+                const contents = try std.fs.cwd().readFileAlloc(allocator, src_file_path, std.math.maxInt(usize));
+                defer allocator.free(contents);
+                try writeFile(dst_file_path, contents);
+            },
+            .directory => try copyDirectory(allocator, src_file_path, dst_file_path),
+            else => {},
+        }
+    }
+}
+
 const build_template =
     \\const std = @import("std");
     \\
@@ -115,8 +140,47 @@ const build_template =
     \\    const target = b.standardTargetOptions(.{});
     \\    const optimize = b.standardOptimizeOption(.{});
     \\
-    \\    // Add zup-api dependency
-    \\    const zup_dep = b.dependency("zup-api", .{});
+    \\    // Core module
+    \\    const core_module = b.addModule("core", .{
+    \\        .root_source_file = .{ .cwd_relative = "src/framework/core.zig" },
+    \\    });
+    \\
+    \\    // Schema module
+    \\    const schema_module = b.addModule("schema", .{
+    \\        .root_source_file = .{ .cwd_relative = "src/framework/trpc/schema.zig" },
+    \\        .imports = &.{
+    \\            .{ .name = "core", .module = core_module },
+    \\        },
+    \\    });
+    \\
+    \\    // Runtime Router module
+    \\    const runtime_router_module = b.addModule("runtime_router", .{
+    \\        .root_source_file = .{ .cwd_relative = "src/framework/trpc/runtime_router.zig" },
+    \\        .imports = &.{
+    \\            .{ .name = "core", .module = core_module },
+    \\            .{ .name = "schema", .module = schema_module },
+    \\        },
+    \\    });
+    \\
+    \\    // Framework module
+    \\    const framework_module = b.addModule("framework", .{
+    \\        .root_source_file = .{ .cwd_relative = "src/framework/server.zig" },
+    \\        .imports = &.{
+    \\            .{ .name = "core", .module = core_module },
+    \\            .{ .name = "schema", .module = schema_module },
+    \\        },
+    \\    });
+    \\
+    \\    // Router module
+    \\    const router_module = b.addModule("router", .{
+    \\        .root_source_file = .{ .cwd_relative = "src/framework/trpc/router.zig" },
+    \\        .imports = &.{
+    \\            .{ .name = "core", .module = core_module },
+    \\            .{ .name = "schema", .module = schema_module },
+    \\            .{ .name = "runtime_router", .module = runtime_router_module },
+    \\            .{ .name = "framework", .module = framework_module },
+    \\        },
+    \\    });
     \\
     \\    // Main executable
     \\    const exe = b.addExecutable(.{
@@ -126,8 +190,9 @@ const build_template =
     \\        .optimize = optimize,
     \\    });
     \\
-    \\    // Add zup-api modules
-    \\    exe.root_module.addImport("api", zup_dep.module("api"));
+    \\    exe.root_module.addImport("core", core_module);
+    \\    exe.root_module.addImport("framework", framework_module);
+    \\    exe.root_module.addImport("router", router_module);
     \\
     \\    b.installArtifact(exe);
     \\
@@ -140,7 +205,9 @@ const build_template =
 
 const grpc_main_template =
     \\const std = @import("std");
-    \\const zup = @import("api");
+    \\const framework = @import("framework");
+    \\const router = @import("router");
+    \\const core = @import("core");
     \\
     \\pub fn main() !void {
     \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -148,19 +215,22 @@ const grpc_main_template =
     \\    defer _ = gpa.deinit();
     \\
     \\    // Initialize server
-    \\    const config = zup.framework.ServerConfig{
+    \\    const config = framework.ServerConfig{
     \\        .port = 8080,
     \\        .host = "127.0.0.1",
     \\    };
-    \\    var server = try zup.framework.Server.init(allocator, config);
+    \\    var server = try framework.Server.init(allocator, config);
     \\    defer server.deinit();
     \\
     \\    // Initialize gRPC router
-    \\    var router = zup.framework.trpc.GrpcRouter.init(allocator);
-    \\    defer router.deinit();
+    \\    var grpc_router = router.Router.init(allocator);
+    \\    defer grpc_router.deinit();
     \\
     \\    // Register procedures
-    \\    try router.procedure("hello", handleHello, null, null);
+    \\    try grpc_router.procedure("hello", handleHello, null, null);
+    \\
+    \\    // Mount router with server
+    \\    try grpc_router.mount(&server);
     \\
     \\    // Start gRPC server
     \\    try server.start();
@@ -172,7 +242,7 @@ const grpc_main_template =
     \\    }
     \\}
     \\
-    \\fn handleHello(ctx: *zup.framework.Context, input: ?std.json.Value) !std.json.Value {
+    \\fn handleHello(ctx: *core.Context, input: ?std.json.Value) !std.json.Value {
     \\    const name = if (input) |value| blk: {
     \\        if (value.object.get("name")) |name_value| {
     \\            break :blk name_value.string;
@@ -197,6 +267,11 @@ fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u
     defer allocator.free(src_path);
     try createDirectory(src_path);
 
+    // Create framework directory
+    const framework_path = try std.fmt.allocPrint(allocator, "{s}/src/framework", .{project_name});
+    defer allocator.free(framework_path);
+    try copyDirectory(allocator, "zup-main/src/framework", framework_path);
+
     // Create main.zig
     const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_name});
     defer allocator.free(main_path);
@@ -206,35 +281,6 @@ fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u
     const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project_name});
     defer allocator.free(build_path);
     try writeFile(build_path, build_template);
-
-    // Create build.zig.zon
-    {
-        const build_zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
-        defer allocator.free(build_zon_path);
-        
-        var build_zon_content = std.ArrayList(u8).init(allocator);
-        defer build_zon_content.deinit();
-        
-        try build_zon_content.appendSlice(".{\n");
-        try build_zon_content.appendSlice("    .name = \"");
-        try build_zon_content.appendSlice(project_name);
-        try build_zon_content.appendSlice("\",\n");
-        try build_zon_content.appendSlice("    .version = \"0.1.0\",\n");
-        try build_zon_content.appendSlice("    .paths = .{\n");
-        try build_zon_content.appendSlice("        \"src\",\n");
-        try build_zon_content.appendSlice("        \"build.zig\",\n");
-        try build_zon_content.appendSlice("        \"build.zig.zon\",\n");
-        try build_zon_content.appendSlice("    },\n");
-        try build_zon_content.appendSlice("    .dependencies = .{\n");
-        try build_zon_content.appendSlice("        .@\"zup-api\" = .{\n");
-        try build_zon_content.appendSlice("            .url = \"https://github.com/openSVM/zup/archive/main.tar.gz\",\n");
-        try build_zon_content.appendSlice("            .hash = \"12207a3bcf418fd5e029f56f3c8049165cf07d758b89d499d36f8a6475d21b425ea2\",\n");
-        try build_zon_content.appendSlice("        },\n");
-        try build_zon_content.appendSlice("    },\n");
-        try build_zon_content.appendSlice("}\n");
-        
-        try writeFile(build_zon_path, build_zon_content.items);
-    }
 
     print("\nProject created successfully!\n", .{});
     print("\nTo get started:\n", .{});
