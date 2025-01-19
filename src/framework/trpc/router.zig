@@ -1,6 +1,6 @@
 const std = @import("std");
 const json = std.json;
-const core = @import("core");
+const core = @import("../core.zig");
 const Schema = @import("schema").Schema;
 const Server = @import("framework").Server;
 const Procedure = @import("./procedure.zig").Procedure;

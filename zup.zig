@@ -6,29 +6,34 @@ const usage =
     \\Usage: zup [options] <project-name>
     \\
     \\Options:
-    \\  --protocol <http|grpc|ws>    Protocol to use (default: grpc)
-    \\  --help                       Show this help message
+    \\  --protocol <http|grpc|ws|http+grpc>    Protocol to use (default: grpc)
+    \\  --help                                 Show this help message
     \\
     \\Example:
-    \\  zup --protocol grpc my-api
+    \\  zup --protocol http+grpc test-api
     \\
 ;
 
+const Protocol = struct {
+    http: bool = false,
+    grpc: bool = false,
+    ws: bool = false,
+};
+
 const Config = struct {
     project_name: []const u8,
-    protocol: []const u8,
+    protocols: Protocol,
 
     pub fn init() Config {
         return .{
             .project_name = "",
-            .protocol = "grpc",
+            .protocols = .{
+                .grpc = true, // default protocol
+            },
         };
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        if (!std.mem.eql(u8, self.protocol, "grpc")) {
-            allocator.free(self.protocol);
-        }
         if (self.project_name.len > 0) {
             allocator.free(self.project_name);
         }
@@ -53,15 +58,25 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--protocol")) {
             next_is_protocol = true;
         } else if (next_is_protocol) {
-            if (!std.mem.eql(u8, arg, "http") and
-                !std.mem.eql(u8, arg, "grpc") and
-                !std.mem.eql(u8, arg, "ws"))
-            {
-                print("Error: protocol must be http, grpc, or ws\n", .{});
-                std.process.exit(1);
+            // Parse combined protocols like "http+grpc"
+            var protocols = std.mem.split(u8, arg, "+");
+            config.protocols = .{};
+            while (protocols.next()) |protocol| {
+                if (std.mem.eql(u8, protocol, "http")) {
+                    config.protocols.http = true;
+                } else if (std.mem.eql(u8, protocol, "grpc")) {
+                    config.protocols.grpc = true;
+                } else if (std.mem.eql(u8, protocol, "ws")) {
+                    config.protocols.ws = true;
+                } else {
+                    print("Error: invalid protocol '{s}'\n", .{protocol});
+                    std.process.exit(1);
+                }
             }
-            if (!std.mem.eql(u8, arg, "grpc")) {
-                config.protocol = try allocator.dupe(u8, arg);
+            // Validate at least one protocol was specified
+            if (!config.protocols.http and !config.protocols.grpc and !config.protocols.ws) {
+                print("Error: at least one valid protocol must be specified\n", .{});
+                std.process.exit(1);
             }
             next_is_protocol = false;
         } else {
@@ -93,30 +108,39 @@ fn writeFile(path: []const u8, contents: []const u8) !void {
     try file.writeAll(contents);
 }
 
-fn copyFile(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
-    const cwd = std.fs.cwd();
-    const source_file = try cwd.openFile(from, .{});
-    defer source_file.close();
-
-    const content = try source_file.readToEndAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(content);
-
-    try writeFile(to, content);
-}
-
-const root_template =
-    \\const zup = @import("zup");
+const build_template =
+    \\const std = @import("std");
     \\
-    \\pub const core = zup.core;
-    \\pub const framework = zup.framework;
-    \\pub const schema = zup.schema;
-    \\pub const runtime_router = zup.runtime_router;
-    \\pub const grpc_router = zup.grpc_router;
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\
+    \\    // Add zup-api dependency
+    \\    const zup_dep = b.dependency("zup-api", .{});
+    \\
+    \\    // Main executable
+    \\    const exe = b.addExecutable(.{
+    \\        .name = "server",
+    \\        .root_source_file = .{ .cwd_relative = "src/main.zig" },
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\    });
+    \\
+    \\    // Add zup-api modules
+    \\    exe.root_module.addImport("api", zup_dep.module("api"));
+    \\
+    \\    b.installArtifact(exe);
+    \\
+    \\    // Run step
+    \\    const run_cmd = b.addRunArtifact(exe);
+    \\    const run_step = b.step("run", "Run the server");
+    \\    run_step.dependOn(&run_cmd.step);
+    \\}
 ;
 
 const grpc_main_template =
     \\const std = @import("std");
-    \\const zup = @import("zup");
+    \\const zup = @import("api");
     \\
     \\pub fn main() !void {
     \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -132,7 +156,7 @@ const grpc_main_template =
     \\    defer server.deinit();
     \\
     \\    // Initialize gRPC router
-    \\    var router = try zup.grpc_router.GrpcRouter.init(allocator);
+    \\    var router = zup.framework.trpc.GrpcRouter.init(allocator);
     \\    defer router.deinit();
     \\
     \\    // Register procedures
@@ -162,62 +186,8 @@ const grpc_main_template =
     \\}
 ;
 
-const build_template =
-    \\const std = @import("std");
-    \\
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
-    \\
-    \\    const zup_dep = b.dependency("zup", .{
-    \\        .target = target,
-    \\        .optimize = optimize,
-    \\    });
-    \\
-    \\    // Main executable
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "server",
-    \\        .root_source_file = .{ .cwd_relative = "src/main.zig" },
-    \\        .target = target,
-    \\        .optimize = optimize,
-    \\    });
-    \\
-    \\    // Add module dependencies
-    \\    exe.root_module.addImport("zup", zup_dep.module("zup"));
-    \\
-    \\    b.installArtifact(exe);
-    \\
-    \\    // Run step
-    \\    const run_cmd = b.addRunArtifact(exe);
-    \\    const run_step = b.step("run", "Run the server");
-    \\    run_step.dependOn(&run_cmd.step);
-    \\}
-;
-
-const build_zon_template =
-    \\.{{
-    \\    .name = "{s}",
-    \\    .version = "0.1.0",
-    \\    .paths = .{{
-    \\        "src",
-    \\        "build.zig",
-    \\        "build.zig.zon",
-    \\    }},
-    \\    .dependencies = .{{
-    \\        .zup = .{{
-    \\            .url = "https://github.com/openSVM/zup/archive/main.tar.gz",
-    \\            .hash = "1220bc3ba76ebbba7f90b363409144a85b24ee584cde5139646a5c2038c09f4a3bfb",
-    \\        }},
-    \\    }},
-    \\}}
-;
-
 fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u8) !void {
     print("Generating gRPC boilerplate for project '{s}'...\n", .{project_name});
-
-    // Create project directory
-    try createDirectory(project_name);
-
 
     // Create project directory
     try createDirectory(project_name);
@@ -226,11 +196,6 @@ fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u
     const src_path = try std.fmt.allocPrint(allocator, "{s}/src", .{project_name});
     defer allocator.free(src_path);
     try createDirectory(src_path);
-
-    // Create root.zig
-    const root_path = try std.fmt.allocPrint(allocator, "{s}/src/root.zig", .{project_name});
-    defer allocator.free(root_path);
-    try writeFile(root_path, root_template);
 
     // Create main.zig
     const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_name});
@@ -243,11 +208,33 @@ fn generateGrpcBoilerplate(allocator: std.mem.Allocator, project_name: []const u
     try writeFile(build_path, build_template);
 
     // Create build.zig.zon
-    const build_zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
-    defer allocator.free(build_zon_path);
-    const build_zon_content = try std.fmt.allocPrint(allocator, build_zon_template, .{project_name});
-    defer allocator.free(build_zon_content);
-    try writeFile(build_zon_path, build_zon_content);
+    {
+        const build_zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
+        defer allocator.free(build_zon_path);
+        
+        var build_zon_content = std.ArrayList(u8).init(allocator);
+        defer build_zon_content.deinit();
+        
+        try build_zon_content.appendSlice(".{\n");
+        try build_zon_content.appendSlice("    .name = \"");
+        try build_zon_content.appendSlice(project_name);
+        try build_zon_content.appendSlice("\",\n");
+        try build_zon_content.appendSlice("    .version = \"0.1.0\",\n");
+        try build_zon_content.appendSlice("    .paths = .{\n");
+        try build_zon_content.appendSlice("        \"src\",\n");
+        try build_zon_content.appendSlice("        \"build.zig\",\n");
+        try build_zon_content.appendSlice("        \"build.zig.zon\",\n");
+        try build_zon_content.appendSlice("    },\n");
+        try build_zon_content.appendSlice("    .dependencies = .{\n");
+        try build_zon_content.appendSlice("        .@\"zup-api\" = .{\n");
+        try build_zon_content.appendSlice("            .url = \"https://github.com/openSVM/zup/archive/main.tar.gz\",\n");
+        try build_zon_content.appendSlice("            .hash = \"12207a3bcf418fd5e029f56f3c8049165cf07d758b89d499d36f8a6475d21b425ea2\",\n");
+        try build_zon_content.appendSlice("        },\n");
+        try build_zon_content.appendSlice("    },\n");
+        try build_zon_content.appendSlice("}\n");
+        
+        try writeFile(build_zon_path, build_zon_content.items);
+    }
 
     print("\nProject created successfully!\n", .{});
     print("\nTo get started:\n", .{});
@@ -263,10 +250,13 @@ pub fn main() !void {
     var config = try parseArgs(allocator);
     defer config.deinit(allocator);
 
-    if (std.mem.eql(u8, config.protocol, "grpc")) {
+    if (config.protocols.grpc) {
         try generateGrpcBoilerplate(allocator, config.project_name);
-    } else {
-        print("Protocol '{s}' not yet implemented\n", .{config.protocol});
-        std.process.exit(1);
+    }
+    if (config.protocols.http) {
+        print("HTTP protocol support coming soon!\n", .{});
+    }
+    if (config.protocols.ws) {
+        print("WebSocket protocol support coming soon!\n", .{});
     }
 }
