@@ -206,7 +206,7 @@ pub const Server = struct {
     }
 };
 
-fn parseRequest(ctx: *core.Context, request: []const u8) !void {
+pub fn parseRequest(ctx: *core.Context, request: []const u8) !void {
     // Split the request into lines
     var lines = std.mem.split(u8, request, "\r\n");
     
