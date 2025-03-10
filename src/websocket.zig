@@ -5,6 +5,15 @@ const mem = std.mem;
 const base64 = std.base64;
 const Sha1 = std.crypto.hash.Sha1;
 
+// Debug flag - set to false in production
+const debug_logging = false;
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (debug_logging) {
+        std.debug.print(fmt, args);
+    }
+}
+
 pub const WebSocketFrame = struct {
     fin: bool = true,
     opcode: Opcode,
@@ -21,13 +30,13 @@ pub const WebSocketFrame = struct {
     };
 
     pub fn encode(self: WebSocketFrame, allocator: std.mem.Allocator, writer: anytype) !void {
-        std.debug.print("\nEncoding frame: opcode={}, mask={}, payload={s}\n", .{ self.opcode, self.mask, self.payload });
+        debugLog("\nEncoding frame: opcode={}, mask={}, payload={s}\n", .{ self.opcode, self.mask, self.payload });
 
         var first_byte: u8 = 0;
         if (self.fin) first_byte |= 0x80;
         first_byte |= @intFromEnum(self.opcode);
         try writer.writeByte(first_byte);
-        std.debug.print("First byte: {b:0>8}\n", .{first_byte});
+        debugLog("First byte: {b:0>8}\n", .{first_byte});
 
         var second_byte: u8 = 0;
         if (self.mask) second_byte |= 0x80;
@@ -45,13 +54,13 @@ pub const WebSocketFrame = struct {
             try writer.writeByte(second_byte);
             try writer.writeInt(u64, @as(u64, @intCast(payload_len)), .big);
         }
-        std.debug.print("Second byte: {b:0>8}\n", .{second_byte});
+        debugLog("Second byte: {b:0>8}\n", .{second_byte});
 
         if (self.mask) {
             // Generate random masking key
             var masking_key: [4]u8 = undefined;
             std.crypto.random.bytes(&masking_key);
-            std.debug.print("Masking key: {any}\n", .{masking_key});
+            debugLog("Masking key: {any}\n", .{masking_key});
 
             // Write masking key
             try writer.writeAll(&masking_key);
@@ -65,25 +74,25 @@ pub const WebSocketFrame = struct {
                 try masked_bytes.append(masked_byte);
             }
             try writer.writeAll(masked_bytes.items);
-            std.debug.print("Masked payload: {any}\n", .{masked_bytes.items});
+            debugLog("Masked payload: {any}\n", .{masked_bytes.items});
         } else {
             try writer.writeAll(self.payload);
-            std.debug.print("Unmasked payload: {any}\n", .{self.payload});
+            debugLog("Unmasked payload: {any}\n", .{self.payload});
         }
     }
 
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !WebSocketFrame {
-        std.debug.print("\nDecoding frame...\n", .{});
+        debugLog("\nDecoding frame...\n", .{});
 
         const first_byte = try reader.readByte();
         const fin = (first_byte & 0x80) != 0;
         const opcode = @as(Opcode, @enumFromInt(first_byte & 0x0F));
-        std.debug.print("First byte: {b:0>8}, fin={}, opcode={}\n", .{ first_byte, fin, opcode });
+        debugLog("First byte: {b:0>8}, fin={}, opcode={}\n", .{ first_byte, fin, opcode });
 
         const second_byte = try reader.readByte();
         const mask = (second_byte & 0x80) != 0;
         const payload_len = second_byte & 0x7F;
-        std.debug.print("Second byte: {b:0>8}, mask={}, initial payload_len={}\n", .{ second_byte, mask, payload_len });
+        debugLog("Second byte: {b:0>8}, mask={}, initial payload_len={}\n", .{ second_byte, mask, payload_len });
 
         const extended_payload_len: u64 = if (payload_len == 126)
             try reader.readInt(u16, .big)
@@ -92,12 +101,12 @@ pub const WebSocketFrame = struct {
         else
             payload_len;
 
-        std.debug.print("Extended payload length: {}\n", .{extended_payload_len});
+        debugLog("Extended payload length: {}\n", .{extended_payload_len});
 
         const masking_key = if (mask) blk: {
             var key: [4]u8 = undefined;
             _ = try reader.readAll(&key);
-            std.debug.print("Masking key: {any}\n", .{key});
+            debugLog("Masking key: {any}\n", .{key});
             break :blk key;
         } else [_]u8{0} ** 4;
 
@@ -108,13 +117,13 @@ pub const WebSocketFrame = struct {
         const n = try reader.readAll(payload);
         if (n != extended_payload_len) return error.InvalidFrame;
 
-        std.debug.print("Raw payload: {any}\n", .{payload});
+        debugLog("Raw payload: {any}\n", .{payload});
 
         if (mask) {
             for (payload, 0..) |*byte, i| {
                 byte.* ^= masking_key[i % 4];
             }
-            std.debug.print("Unmasked payload: {any}\n", .{payload});
+            debugLog("Unmasked payload: {any}\n", .{payload});
         }
 
         const frame = WebSocketFrame{
@@ -124,7 +133,7 @@ pub const WebSocketFrame = struct {
             .payload = payload,
         };
 
-        std.debug.print("Decoded frame: opcode={}, mask={}, payload={s}\n", .{ frame.opcode, frame.mask, frame.payload });
+        debugLog("Decoded frame: opcode={}, mask={}, payload={s}\n", .{ frame.opcode, frame.mask, frame.payload });
         return frame;
     }
 };
