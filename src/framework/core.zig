@@ -49,9 +49,10 @@ pub const Request = struct {
     }
     
     pub fn deinit(self: *Request) void {
+        var allocator = self.headers.allocator;
         self.headers.deinit();
         if (self.body) |body| {
-            self.headers.allocator.free(body);
+            allocator.free(body);
         }
     }
 };
@@ -70,9 +71,10 @@ pub const Response = struct {
     }
     
     pub fn deinit(self: *Response) void {
+        var allocator = self.headers.allocator;
         self.headers.deinit();
         if (self.body) |body| {
-            self.headers.allocator.free(body);
+            allocator.free(body);
         }
     }
 };

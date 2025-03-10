@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const Router = @import("router.zig").Router;
 const net = std.net;
 const Thread = std.Thread;
 const Atomic = std.atomic.Atomic;
@@ -19,7 +20,7 @@ pub const Server = struct {
     running: Atomic(bool) = Atomic(bool).init(false),
     threads: std.ArrayList(Thread) = undefined,
     
-    pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Server {
+    pub fn init(allocator: std.mem.Allocator, config: ServerConfig, router: ?*const Router) !Server {
         const address = try net.Address.parseIp(config.host, config.port);
         
         return Server{
@@ -27,6 +28,7 @@ pub const Server = struct {
             .config = config,
             .address = address,
             .threads = std.ArrayList(Thread).init(allocator),
+            .router = router,
         };
     }
     
@@ -151,22 +153,56 @@ pub const Server = struct {
         try ctx.response.headers.put("Content-Type", "text/plain");
         try ctx.response.headers.put("Server", "Zup");
         
-        // TODO: Route the request to the appropriate handler
+        // Route the request to the appropriate handler if router is available
+        if (server.router) |router| {
+            router.handle(&ctx) catch |err| {
+                if (err == error.RouteNotFound) {
+                    ctx.response.status = 404;
+                    ctx.response.body = try server.allocator.dupe(u8, "Not Found");
+                } else {
+                    ctx.response.status = 500;
+                    ctx.response.body = try server.allocator.dupe(u8, "Internal Server Error");
+                    std.log.err("Error handling request: {s}", .{@errorName(err)});
+                }
+            };
+        } else {
+            // If no router, just return a simple response
+            ctx.response.body = try server.allocator.dupe(u8, "Hello from Zup Server!");
+        }
         
-        // For now, just return a simple response
-        const response = try std.fmt.allocPrint(
-            server.allocator,
-            "HTTP/1.1 {d} OK\r\n" ++
-                "Content-Type: text/plain\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n" ++
-                "\r\n" ++
-                "Hello from Zup Server!",
-            .{ ctx.response.status, "Hello from Zup Server!".len },
-        );
-        defer server.allocator.free(response);
+        // Build and send the HTTP response
+        var response_buffer = std.ArrayList(u8).init(server.allocator);
+        defer response_buffer.deinit();
         
-        _ = try connection.stream.write(response);
+        // Write status line
+        try std.fmt.format(response_buffer.writer(), "HTTP/1.1 {d} {s}\r\n", .{
+            ctx.response.status,
+            if (ctx.response.status == 200) "OK" else "Error",
+        });
+        
+        // Write headers
+        var header_it = ctx.response.headers.iterator();
+        while (header_it.next()) |entry| {
+            try std.fmt.format(response_buffer.writer(), "{s}: {s}\r\n", .{
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+            });
+        }
+        
+        // Write Content-Length header
+        const body_len = if (ctx.response.body) |body| body.len else 0;
+        try std.fmt.format(response_buffer.writer(), "Content-Length: {d}\r\n", .{body_len});
+        
+        // End headers
+        try response_buffer.appendSlice("\r\n");
+        
+        // Write body if present
+        if (ctx.response.body) |body| {
+            try response_buffer.appendSlice(body);
+        }
+        
+        // Send the response
+        _ = try connection.stream.write(response_buffer.items);
     }
 };
 
@@ -200,18 +236,62 @@ fn parseRequest(ctx: *core.Context, request: []const u8) !void {
         );
     }
     
-    // TODO: Parse body if present
+    // Parse body if present
+    // Find the empty line that separates headers from body
+    var body_start: usize = 0;
+    const headers_end = std.mem.indexOf(u8, request, "\r\n\r\n");
+    if (headers_end) |pos| {
+        body_start = pos + 4; // Skip the \r\n\r\n
+        
+        // Check if there's a body
+        if (body_start < request.len) {
+            const body = request[body_start..];
+            if (body.len > 0) {
+                ctx.request.body = try ctx.allocator.dupe(u8, body);
+            }
+        }
+    }
 }
 
 fn handleWebSocketUpgrade(allocator: std.mem.Allocator, stream: net.Stream, request: []const u8) !void {
-    // This is a placeholder for WebSocket upgrade handling
-    // In a real implementation, you would:
-    // 1. Parse the WebSocket key from the request
-    // 2. Generate the accept key
-    // 3. Send the upgrade response
-    // 4. Handle the WebSocket connection
+    const websocket = @import("../websocket.zig");
+    try websocket.handleUpgrade(allocator, stream, request);
     
-    _ = allocator;
-    _ = stream;
-    _ = request;
+    // After upgrade, handle the WebSocket connection
+    // This is a simple echo server for demonstration
+    while (true) {
+        var frame = websocket.readMessage(allocator, stream) catch |err| {
+            if (err == error.ConnectionClosed) {
+                break;
+            }
+            std.log.err("Error reading WebSocket message: {s}", .{@errorName(err)});
+            break;
+        };
+        defer allocator.free(frame.payload);
+        
+        // Handle different frame types
+        switch (frame.opcode) {
+            .text, .binary => {
+                // Echo the message back
+                try websocket.writeMessage(allocator, stream, frame.payload);
+            },
+            .close => {
+                // Send close frame and exit
+                try websocket.writeMessage(allocator, stream, "");
+                break;
+            },
+            .ping => {
+                // Respond to ping with pong
+                const pong_frame = websocket.WebSocketFrame{
+                    .opcode = .pong,
+                    .payload = frame.payload,
+                };
+                var frame_buf: [1024]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&frame_buf);
+                try pong_frame.encode(allocator, fbs.writer());
+                _ = try stream.write(fbs.getWritten());
+            },
+            else => {}, // Ignore other frame types
+        }
+    }
 }

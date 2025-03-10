@@ -6,6 +6,9 @@ const Server = @import("framework/server.zig").Server;
 const ServerConfig = @import("framework/server.zig").ServerConfig;
 const Router = @import("framework/router.zig").Router;
 
+// Global variable to hold server reference for signal handling
+var global_server: ?*Server = null;
+
 // Example handler that returns a greeting
 fn greetingHandler(ctx: *core.Context) !void {
     // Parse request body if present
@@ -128,8 +131,11 @@ pub fn main() !void {
     };
     
     // Create and start server
-    var server = try Server.init(allocator, config);
+    var server = try Server.init(allocator, config, &router);
     defer server.deinit();
+    
+    // Set global server reference for signal handling
+    global_server = &server;
     
     std.log.info("Starting server on {s}:{d}...", .{config.host, config.port});
     
@@ -170,5 +176,7 @@ pub fn main() !void {
 
 fn handleSignal(sig: c_int) callconv(.C) void {
     std.log.info("Received signal {d}, shutting down...", .{sig});
-    // The server will be stopped in the main thread
+    if (global_server) |server| {
+        server.stop();
+    }
 }

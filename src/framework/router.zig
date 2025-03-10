@@ -79,7 +79,7 @@ pub const Router = struct {
         const route = self.findRoute(ctx.request.method, ctx.request.path) orelse return error.RouteNotFound;
 
         // Extract path parameters
-        try self.extractParams(ctx, route.pattern, ctx.request.path);
+        try extractParams(ctx, route.pattern, ctx.request.path);
 
         // If no middleware, just call the handler
         if (self.global_middleware.items.len == 0) {
@@ -145,9 +145,7 @@ pub const Router = struct {
         }
     }
     
-    fn extractParams(self: *Router, ctx: *core.Context, pattern: []const u8, path: []const u8) !void {
-        _ = self;
-        
+    fn extractParams(ctx: *core.Context, pattern: []const u8, path: []const u8) !void {
         var pattern_parts = std.mem.split(u8, pattern, "/");
         var path_parts = std.mem.split(u8, path, "/");
         
