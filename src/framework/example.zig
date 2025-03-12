@@ -1,7 +1,8 @@
 const std = @import("std");
 const Server = @import("server.zig").Server;
-const Config = @import("server.zig").Config;
+const ServerConfig = @import("server.zig").ServerConfig;
 const core = @import("core.zig");
+const Router = @import("router.zig").Router;
 
 // Example middleware that logs requests
 const LoggerMiddleware = struct {
@@ -27,9 +28,25 @@ const LoggerMiddleware = struct {
     }
 };
 
+// Helper function to set text response
+fn setText(ctx: *core.Context, text: []const u8) !void {
+    ctx.response.body = try ctx.allocator.dupe(u8, text);
+    try ctx.response.headers.put("Content-Type", "text/plain");
+}
+
+// Helper function to set JSON response
+fn setJson(ctx: *core.Context, data: anytype) !void {
+    var json_string = std.ArrayList(u8).init(ctx.allocator);
+    defer json_string.deinit();
+    
+    try std.json.stringify(data, .{}, json_string.writer());
+    ctx.response.body = try ctx.allocator.dupe(u8, json_string.items);
+    try ctx.response.headers.put("Content-Type", "application/json");
+}
+
 // Example handlers
 fn homeHandlerImpl(ctx: *core.Context) !void {
-    try ctx.text("Welcome to Zup!");
+    try setText(ctx, "Welcome to Zup!");
 }
 
 fn jsonHandlerImpl(ctx: *core.Context) !void {
@@ -37,7 +54,7 @@ fn jsonHandlerImpl(ctx: *core.Context) !void {
         .message = "Hello, JSON!",
         .timestamp = std.time.timestamp(),
     };
-    try ctx.json(data);
+    try setJson(ctx, data);
 }
 
 fn userHandlerImpl(ctx: *core.Context) !void {
@@ -47,11 +64,15 @@ fn userHandlerImpl(ctx: *core.Context) !void {
         .name = "Example User",
         .email = "user@example.com",
     };
-    try ctx.json(response);
+    try setJson(ctx, response);
 }
 
 fn echoHandlerImpl(ctx: *core.Context) !void {
-    try ctx.text(ctx.request.body);
+    if (ctx.request.body) |body| {
+        try setText(ctx, body);
+    } else {
+        try setText(ctx, "No body provided");
+    }
 }
 
 pub fn main() !void {
@@ -60,24 +81,28 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Create server with custom config
-    var server = try Server.init(allocator, .{
-        .address = "127.0.0.1",
-        .port = 8080,
-        .thread_count = 4,
-    });
-    defer server.deinit();
+    // Create router
+    var router = Router.init(allocator);
+    defer router.deinit();
 
     // Add global middleware
     var logger = LoggerMiddleware.init();
     defer logger.deinit();
-    try server.use(core.Middleware.init(logger, LoggerMiddleware.handle));
+    try router.use(core.Middleware.init(logger, LoggerMiddleware.handle));
 
     // Define routes
-    try server.get("/", homeHandlerImpl);
-    try server.get("/json", jsonHandlerImpl);
-    try server.get("/users/:id", userHandlerImpl);
-    try server.post("/echo", echoHandlerImpl);
+    try router.get("/", homeHandlerImpl);
+    try router.get("/json", jsonHandlerImpl);
+    try router.get("/users/:id", userHandlerImpl);
+    try router.post("/echo", echoHandlerImpl);
+
+    // Create server with custom config
+    var server = try Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .thread_count = 4,
+    }, &router);
+    defer server.deinit();
 
     // Start server
     std.log.info("Server running at http://127.0.0.1:8080", .{});
@@ -88,33 +113,46 @@ test "basic routes" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var server = try Server.init(allocator, .{
-        .port = 0, // Random port for testing
-    });
-    defer server.deinit();
+    // Create router
+    var router = Router.init(allocator);
+    defer router.deinit();
 
     // Add test routes
-    try server.get("/test", &struct {
+    try router.get("/test", &struct {
         fn handler(ctx: *core.Context) !void {
-            try ctx.text("test ok");
+            try setText(ctx, "test ok");
         }
     }.handler);
 
-    try server.post("/echo", echoHandlerImpl);
+    try router.post("/echo", echoHandlerImpl);
+
+    // Create server
+    var server = try Server.init(allocator, .{
+        .port = 0, // Random port for testing
+        .thread_count = 1,
+    }, &router);
+    defer server.deinit();
 
     // Start server in background
-    const thread = try std.Thread.spawn(.{}, Server.start, .{&server});
-    defer {
-        server.running.store(false, .release);
-        thread.join();
-    }
+    var running = true;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(srv: *Server, is_running: *bool) void {
+            srv.start() catch |err| {
+                std.debug.print("Server error: {}\n", .{err});
+            };
+            is_running.* = false;
+        }
+    }.run, .{&server, &running});
 
     // Wait a bit for server to start
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Get server address
+    const server_address = server.address;
 
     // Test GET request
     {
-        const client = try std.net.tcpConnectToAddress(server.listener.listen_address);
+        const client = try std.net.tcpConnectToAddress(server_address);
         defer client.close();
 
         try client.writer().writeAll(
@@ -134,7 +172,7 @@ test "basic routes" {
 
     // Test POST request
     {
-        const client = try std.net.tcpConnectToAddress(server.listener.listen_address);
+        const client = try std.net.tcpConnectToAddress(server_address);
         defer client.close();
 
         const body = "Hello, Echo!";
@@ -156,4 +194,8 @@ test "basic routes" {
 
         try testing.expect(std.mem.indexOf(u8, response, body) != null);
     }
+
+    // Stop server
+    server.stop();
+    thread.join();
 }

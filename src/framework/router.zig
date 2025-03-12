@@ -78,6 +78,9 @@ pub const Router = struct {
         // Find matching route
         const route = self.findRoute(ctx.request.method, ctx.request.path) orelse return error.RouteNotFound;
 
+        // Extract path parameters
+        try extractParams(ctx, route.pattern, ctx.request.path);
+
         // If no middleware, just call the handler
         if (self.global_middleware.items.len == 0) {
             return route.handler(ctx);
@@ -103,21 +106,61 @@ pub const Router = struct {
 
     fn matchPattern(self: *Router, pattern: []const u8, path: []const u8) bool {
         _ = self;
+        
+        // Handle root path
+        if (std.mem.eql(u8, pattern, "/") and std.mem.eql(u8, path, "/")) {
+            return true;
+        }
+        
         var pattern_parts = std.mem.split(u8, pattern, "/");
         var path_parts = std.mem.split(u8, path, "/");
-
+        
+        // Skip empty first part if path starts with "/"
+        if (pattern.len > 0 and pattern[0] == '/') _ = pattern_parts.next();
+        if (path.len > 0 and path[0] == '/') _ = path_parts.next();
+        
         while (true) {
             const pattern_part = pattern_parts.next() orelse {
+                // If we've reached the end of the pattern, the match is successful
+                // only if we've also reached the end of the path
                 return path_parts.next() == null;
             };
-            const path_part = path_parts.next() orelse return false;
-
+            
+            const path_part = path_parts.next() orelse {
+                // If we've reached the end of the path but not the pattern,
+                // the match fails
+                return false;
+            };
+            
+            // Handle path parameters (starting with ":")
             if (std.mem.startsWith(u8, pattern_part, ":")) {
+                // This is a path parameter, it matches any path part
                 continue;
             }
-
+            
+            // For regular path parts, they must match exactly
             if (!std.mem.eql(u8, pattern_part, path_part)) {
                 return false;
+            }
+        }
+    }
+    
+    fn extractParams(ctx: *core.Context, pattern: []const u8, path: []const u8) !void {
+        var pattern_parts = std.mem.split(u8, pattern, "/");
+        var path_parts = std.mem.split(u8, path, "/");
+        
+        // Skip empty first part if path starts with "/"
+        if (pattern.len > 0 and pattern[0] == '/') _ = pattern_parts.next();
+        if (path.len > 0 and path[0] == '/') _ = path_parts.next();
+        
+        while (true) {
+            const pattern_part = pattern_parts.next() orelse break;
+            const path_part = path_parts.next() orelse break;
+            
+            // Extract parameter if pattern part starts with ":"
+            if (std.mem.startsWith(u8, pattern_part, ":")) {
+                const param_name = pattern_part[1..]; // Skip the ":" prefix
+                try ctx.params.put(param_name, path_part);
             }
         }
     }
